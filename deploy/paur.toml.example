@@ -1,0 +1,60 @@
+# Sample paur config. Copy to `/var/lib/paur/config.toml` and edit
+# for your environment. Any field omitted falls back to the default
+# shown in the comment.
+#
+# The daemon reads this file on each `paur serve` startup. Most
+# options can be overridden via `PAUR_DATA_DIR` (changes the data
+# root and all derived paths).
+
+# Where paur stores all mutable runtime data (db, work dirs, ccache,
+# gpg keyring, logs). The unit file at deploy/paur.service assumes
+# this is /var/lib/paur.
+data_dir = "/var/lib/paur"
+
+# Where the published pacman repo lives. The static server in
+# Caddy reads from here.
+# repo_dir = "<data_dir>/repo"
+
+# Per-build work directories.
+# work_dir = "<data_dir>/work"
+
+# Build log directory.
+# logs_dir = "<data_dir>/logs"
+
+# ccache directory; bind-mounted into the build container so
+# repeated builds of the same package are fast.
+# ccache_dir = "<data_dir>/ccache"
+
+# GPG keyring used for signing the repo and the packages.
+# gpg_home = "<data_dir>/.gnupg"
+
+# The pacman repo name as clients see it (e.g. `[paur]` in
+# pacman.conf).
+# repo_name = "paur"
+
+# Architecture subdirectory of the repo.
+# arch = "x86_64"
+
+# Container runtime: "docker" or "podman".
+# container_runtime = "docker"
+
+# Builder image (built from container/Dockerfile).
+# builder_image = "paur-builder:latest"
+
+# Concurrent build workers. Must be 1 today; the implementation
+# needs a shared mutex around repo-add to raise this safely.
+# max_workers = 1
+
+# AUR poller interval, in seconds. Packages with `auto_rebuild = true`
+# are checked against `git ls-remote` HEAD this often.
+# poll_interval_secs = 600
+
+# Where the daemon listens. axum 0.7 only accepts a TCP listener,
+# so this is the loopback fallback the Caddyfile reverse-proxies
+# to. The Unix variant is a placeholder for a future axum version.
+# listen = "127.0.0.1:7300"
+# listen = "0.0.0.0:7300"
+
+# The URL the repo is served at, used in `paur print-pacman-conf` and
+# in the UI's pacman.conf hint.
+# public_base_url = "https://paur.example"

@@ -1,0 +1,27 @@
+[package]
+name = "paur-builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spawn AUR build containers and stream their logs"
+
+[dependencies]
+paur-core = { workspace = true }
+paur-aur = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+walkdir = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

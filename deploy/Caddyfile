@@ -1,0 +1,61 @@
+# Caddyfile for paur.
+#
+# Layout:
+#   /                 → static SvelteKit UI (built into web/build/)
+#   /api/v1/*         → the daemon's HTTP API
+#   /repo/$arch/*     → the published pacman repo (signed .pkg.tar.zst,
+#                      paur.db.tar.gz, .sig, paur.pubkey.asc)
+#
+# Adjust `root` and the bind address to taste. This config assumes
+# the daemon is listening on the loopback fallback (127.0.0.1:7300)
+# since axum 0.7 doesn't accept a unix listener.
+
+{
+    # auto_https off if you'd rather terminate TLS yourself.
+    auto_https on
+}
+
+# Primary site. Replace `paur.example` with your hostname.
+paur.example, https://paur.example {
+    root * /var/lib/paur/web
+
+    encode zstd gzip
+
+    # Static repo files first — these are the actual packages and DB
+    # that `pacman -Sy` fetches. We set short caching so a new build
+    # is visible after the next `pacman -Sy`.
+    @repo path /repo/*
+    handle @repo {
+        root * /var/lib/paur/repo
+        file_server
+        header Cache-Control "no-cache, must-revalidate"
+    }
+
+    # Daemon HTTP API (the SvelteKit UI talks to this through the
+    # Vite dev proxy, and at runtime through this reverse proxy).
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:7300 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # SSE needs long-lived connections; Caddy's defaults are fine,
+    # but be explicit about timeouts so the UI's log-stream doesn't
+    # get cut off.
+    reverse_proxy 127.0.0.1:7300 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 1h
+        }
+    }
+
+    # Static UI assets.
+    file_server
+    # SPA fallback: send anything else to the SvelteKit index.html
+    # so client-side routing works on hard refresh.
+    try_files {path} {path}.html /index.html
+}

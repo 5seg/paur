@@ -1,0 +1,46 @@
+[Unit]
+Description=paur - personal AUR pre-build service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paur
+Group=paur
+WorkingDirectory=/var/lib/paur
+
+# Locate the data dir, repo dir, and gpg home. systemd's
+# RuntimeDirectory= creates /run/paur on boot; we mount it so the
+# gpg socket lives there.
+RuntimeDirectory=paur
+RuntimeDirectoryMode=0750
+StateDirectory=paur
+StateDirectoryMode=0750
+
+Environment=GNUPGHOME=/var/lib/paur/.gnupg
+Environment=PAUR_DATA_DIR=/var/lib/paur
+# Container runtime detection. The paur-builder image is built from
+# container/Dockerfile once on the host.
+Environment=PAUR_BUILDER_IMAGE=paur-builder:latest
+
+# We expose a TCP port (axum 0.7 doesn't accept a unix socket). 7300
+# is the default and matches the Caddyfile and CLI fallback.
+ExecStart=/usr/bin/paur serve --config /var/lib/paur/config.toml
+
+Restart=on-failure
+RestartSec=5s
+# Give the build enough headroom — a single makepkg run can take
+# tens of minutes for big packages.
+TimeoutStopSec=120s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/paur /run/paur
+# Bind-mount access for the container runtime.
+MountFlags=shared
+
+[Install]
+WantedBy=multi-user.target

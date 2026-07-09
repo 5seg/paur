@@ -1,0 +1,32 @@
+# Build output
+target/
+**/*.rs.bk
+
+# Runtime data
+/var/lib/paur/
+
+# Repo artifacts
+repo/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local config
+config.toml
+config.local.toml
+
+# Logs
+*.log
+logs/
+
+# Session memory (CLI session notes)
+.remember/
+
+# CLI local config
+.openclaude/

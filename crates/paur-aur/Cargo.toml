@@ -1,0 +1,19 @@
+[package]
+name = "paur-aur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AUR git + .SRCINFO parsing for paur"
+
+[dependencies]
+paur-core = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
