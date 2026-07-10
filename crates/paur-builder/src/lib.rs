@@ -22,6 +22,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use paur_core::{Config, ContainerRuntime, PkgName};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// What to build, where to put artifacts, and how to find the runtime.
 #[derive(Debug, Clone)]
@@ -92,9 +94,21 @@ pub async fn run_in_container(
 ) -> paur_core::Result<BuildOutcome> {
     // Pre-create the expected on-disk layout. The container is bind-
     // mounted to /work and /ccache, both of which must exist.
+    // Use 0o777 so the container's `builder` user (whose uid will
+    // not match the host's paur user) can still write into the
+    // bind-mounted directories.
     std::fs::create_dir_all(&req.work_dir)?;
+    std::fs::set_permissions(&req.work_dir, std::fs::Permissions::from_mode(0o777))?;
     std::fs::create_dir_all(req.work_dir.join("out"))?;
+    std::fs::set_permissions(
+        req.work_dir.join("out"),
+        std::fs::Permissions::from_mode(0o777),
+    )?;
     std::fs::create_dir_all(&req.ccache_dir)?;
+    std::fs::set_permissions(
+        &req.ccache_dir,
+        std::fs::Permissions::from_mode(0o777),
+    )?;
 
     // Build the docker/podman command line. Keep it short and
     // explicit; do not introduce configuration knobs until a use case
@@ -257,8 +271,17 @@ pub async fn run_local_in_container(
     sink: std::sync::Arc<dyn LogSink>,
 ) -> paur_core::Result<BuildOutcome> {
     std::fs::create_dir_all(&req.work_dir)?;
+    std::fs::set_permissions(&req.work_dir, std::fs::Permissions::from_mode(0o777))?;
     std::fs::create_dir_all(req.work_dir.join("out"))?;
+    std::fs::set_permissions(
+        req.work_dir.join("out"),
+        std::fs::Permissions::from_mode(0o777),
+    )?;
     std::fs::create_dir_all(&req.ccache_dir)?;
+    std::fs::set_permissions(
+        &req.ccache_dir,
+        std::fs::Permissions::from_mode(0o777),
+    )?;
 
     let bin = req.runtime.binary();
     let mut cmd = Command::new(bin);
