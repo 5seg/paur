@@ -17,19 +17,6 @@
 
 set -euo pipefail
 
-mode="${1:-}"
-
-case "$mode" in
-    local)
-        build_local
-        ;;
-    *)
-        pkg="${1:?package name required}"
-        url="${2:?aur url required}"
-        build_aur "$pkg" "$url"
-        ;;
-esac
-
 build_aur() {
     local pkg="$1" url="$2"
 
@@ -116,3 +103,17 @@ move_artifacts() {
     echo "==> paur: built ${#artifacts[@]} artifact(s) for ${label}"
     ls -l /work/out
 }
+
+# Dispatch. Defined last so all functions are visible.
+mode="${1:-}"
+
+case "$mode" in
+    local)
+        build_local
+        ;;
+    *)
+        pkg="${1:?package name required}"
+        url="${2:?aur url required}"
+        build_aur "$pkg" "$url"
+        ;;
+esac
