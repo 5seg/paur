@@ -226,6 +226,123 @@ pub fn request_for(cfg: &Config, pkg: &PkgName, build_id: i64) -> BuildRequest {
     }
 }
 
+/// What to build from a *local* PKGBUILD directory. Used by
+/// `keyring-build` to produce the `paur-keyring` and `paur-mirrorlist`
+/// meta-packages without going through AUR.
+#[derive(Debug, Clone)]
+pub struct LocalBuildRequest {
+    /// Display name (used for log labels and the workdir basename).
+    pub label: String,
+    /// Host path to a directory containing a single `PKGBUILD`. The
+    /// entire directory is bind-mounted to `/work/src` in the
+    /// container.
+    pub pkgbuild_dir: PathBuf,
+    /// Per-build work directory; the daemon (or CLI) hands out a
+    /// fresh one.
+    pub work_dir: PathBuf,
+    /// ccache dir to bind-mount into the container.
+    pub ccache_dir: PathBuf,
+    /// Container runtime to invoke.
+    pub runtime: ContainerRuntime,
+    /// Container image name.
+    pub image: String,
+}
+
+/// Run a local PKGBUILD build in a container. Unlike `run_in_container`
+/// this skips the AUR clone step — the host is expected to have
+/// already laid out a directory containing the PKGBUILD and any
+/// auxiliary files (`.install`, sources, etc.).
+pub async fn run_local_in_container(
+    req: &LocalBuildRequest,
+    sink: std::sync::Arc<dyn LogSink>,
+) -> paur_core::Result<BuildOutcome> {
+    std::fs::create_dir_all(&req.work_dir)?;
+    std::fs::create_dir_all(req.work_dir.join("out"))?;
+    std::fs::create_dir_all(&req.ccache_dir)?;
+
+    let bin = req.runtime.binary();
+    let mut cmd = Command::new(bin);
+    cmd.args(["run", "--rm"])
+        // /work/src is the PKGBUILD dir; the local-build entrypoint
+        // is hardcoded to look there.
+        .arg("-v")
+        .arg(format!("{}:/work/src:ro", req.pkgbuild_dir.display()))
+        .arg("-v")
+        .arg(format!("{}:/work/out", req.work_dir.display()))
+        .arg("-v")
+        .arg(format!("{}:/ccache", req.ccache_dir.display()))
+        .arg("-e")
+        .arg("CCACHE_DIR=/ccache")
+        .arg(&req.image)
+        .arg("local") // build-local.sh branch
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    tracing::info!(
+        runtime = bin,
+        image = %req.image,
+        label = %req.label,
+        pkgbuild_dir = %req.pkgbuild_dir.display(),
+        work_dir = %req.work_dir.display(),
+        "spawning local build container"
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        paur_core::Error::Build(format!("failed to spawn {bin} run: {e}"))
+    })?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        paur_core::Error::Build("child stdout not captured".into())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        paur_core::Error::Build("child stderr not captured".into())
+    })?;
+
+    let out_task = {
+        let sink = std::sync::Arc::clone(&sink);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = sink.write(&line).await;
+            }
+        })
+    };
+    let err_task = {
+        let sink = std::sync::Arc::clone(&sink);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = sink.write(&line).await;
+            }
+        })
+    };
+
+    let status = child.wait().await.map_err(|e| {
+        paur_core::Error::Build(format!("waiting on {bin} run: {e}"))
+    })?;
+    let _ = out_task.await;
+    let _ = err_task.await;
+
+    let exit_code = status.code().unwrap_or(-1);
+    tracing::info!(label = %req.label, exit_code, "local build container finished");
+
+    // Local builds don't have a real .SRCINFO until we parse the
+    // PKGBUILD — but we don't need one for repo-add (which only
+    // inspects the .pkg.tar.* files).
+    let pkg_files = if exit_code == 0 {
+        list_artifacts(&req.work_dir.join("out"))?
+    } else {
+        Vec::new()
+    };
+
+    Ok(BuildOutcome {
+        exit_code,
+        pkg_files,
+        srcinfo: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

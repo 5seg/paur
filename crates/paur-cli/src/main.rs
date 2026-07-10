@@ -97,6 +97,10 @@ enum Cmd {
     Doctor,
     /// Print the lines to add to `/etc/pacman.conf`.
     PrintPacmanConf,
+    /// Build and publish the `paur-keyring` and `paur-mirrorlist`
+    /// meta-packages. After running this, a client can install both
+    /// with `pacman -U` and never has to look up a fingerprint.
+    KeyringBuild,
     /// Run the daemon (foreground). Equivalent to `paur serve`.
     Serve {
         /// Override `max_workers` from config.
@@ -187,6 +191,7 @@ async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
             cmd::print_pacman_conf(&cfg);
             Ok(())
         }
+        Cmd::KeyringBuild => cmd::keyring_build(&cfg).await,
         Cmd::Serve { max_workers } => {
             // Delegate to paur-daemon.
             paur_serve::serve(&cfg, max_workers).await

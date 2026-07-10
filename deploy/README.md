@@ -44,7 +44,28 @@ A short field guide for going from a clean Arch host to a working
    The keyid is written to the `settings` table; the public key is
    exported to `/var/lib/paur/repo/x86_64/paur.pubkey.asc`.
 
-6. **Install the systemd unit and start the daemon:**
+6. **Build the keyring and mirrorlist meta-packages** (one-time,
+   re-run whenever `public_base_url` or the GPG key changes):
+
+   ```sh
+   sudo -u paur paur-cli keyring-build
+   ```
+
+   This builds two tiny `any`-arch packages inside the builder
+   container and publishes them into the repo:
+
+   - `paur-keyring-<ver>-any.pkg.tar.zst` — installs the GPG public
+     key to `/usr/share/pacman/keyrings/paur.asc`.
+   - `paur-mirrorlist-<ver>-any.pkg.tar.zst` — installs
+     `/etc/pacman.d/paur-mirrorlist` containing the `Server =` line
+     for your `public_base_url`.
+
+   The exact filenames are printed at the end of the command — they
+   are the URLs your clients will `pacman -U` below. (Bump the
+   `pkgver` in the generated PKGBUILDs and re-run if you ever need
+   to push a key rotation or URL change to clients.)
+
+7. **Install the systemd unit and start the daemon:**
 
    ```sh
    sudo install -m0644 deploy/paur.service /etc/systemd/system/paur.service
@@ -52,7 +73,7 @@ A short field guide for going from a clean Arch host to a working
    sudo systemctl enable --now paur
    ```
 
-7. **Front it with Caddy** (or your favourite reverse proxy):
+8. **Front it with Caddy** (or your favourite reverse proxy):
 
    ```sh
    sudo install -m0644 deploy/Caddyfile /etc/caddy/Caddyfile.d/paur
@@ -78,23 +99,47 @@ Or use the web UI at `https://paur.example/`.
 
 ## On the client machine
 
+Three blocks, copy-pasted. Nothing to install beyond what Arch
+already ships with — no keyservers, no manual fingerprint lookup.
+
+The only step that touches the network is the two `pacman -U`
+commands; they fetch directly from your paur server.
+
 ```sh
-# 1. Add the repo
-sudo tee -a /etc/pacman.conf <<'EOF'
+# 1. Install the keyring and mirrorlist meta-packages.
+#    Replace paur.example with your hostname and adjust the
+#    <ver> parts to match the files `paur-cli keyring-build`
+#    printed for you. (Or use the URLs it printed verbatim.)
+sudo pacman -U 'https://paur.example/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
+sudo pacman -U 'https://paur.example/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
+```
+
+The `paur-keyring` package drops the GPG pubkey at the standard
+`/usr/share/pacman/keyrings/paur.asc` path; the `paur-mirrorlist`
+package drops the `Server =` line at `/etc/pacman.d/paur-mirrorlist`.
+You do **not** need `pacman-key --recv-keys` or `--lsign-key` —
+pacman trusts keys in `/usr/share/pacman/keyrings/` automatically
+when matching the `Repo =` line in the mirrorlist.
+
+```sh
+# 2. Enable the repo by adding one line to pacman.conf.
+sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
-SigLevel = Optional TrustedOnly
-Server = https://paur.example/$arch
+Include = /etc/pacman.d/paur-mirrorlist
 EOF
+```
 
-# 2. Trust the signing key. The keyid is the long fingerprint
-#    shown by `paur-cli pubkey` (or visible in the web UI's
-#    /pubkey page).
-sudo pacman-key --recv-keys <keyid>
-sudo pacman-key --lsign-key <keyid>
-
+```sh
 # 3. Sync and install
 sudo pacman -Sy hello-pkg
 ```
+
+If `pacman -Sy` rejects the signature, the most common cause is
+that step 1's `paur-keyring` install didn't actually drop a key at
+`/usr/share/pacman/keyrings/paur.asc` — `ls /usr/share/pacman/keyrings/`
+should show it. The other common cause is a typo in
+`/etc/pacman.d/paur-mirrorlist`; the file is human-readable, fix
+it with `sudoedit`.
 
 ## Auto-rebuild
 

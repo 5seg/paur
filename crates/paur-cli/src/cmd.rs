@@ -427,11 +427,185 @@ pub fn print_pacman_conf(cfg: &Config) {
     println!("# paur: add these lines to /etc/pacman.conf");
     println!("[{}]", cfg.repo_name);
     println!("SigLevel = Optional TrustedOnly");
-    println!("Server = {}/$arch", cfg.public_base_url.trim_end_matches('/'));
+    println!("Include = /etc/pacman.d/{}-mirrorlist", cfg.repo_name);
     println!();
-    println!("# Then trust the key:");
-    println!("#   sudo pacman-key --recv-keys <keyid shown by `paur-cli pubkey`>");
-    println!("#   sudo pacman-key --lsign-key <keyid>");
+    println!("# The [paur] repo entry pulls the mirror URL from the package");
+    println!("# installed by `paur-cli keyring-build`:");
+    println!("#   sudo pacman -U <URL of {repo}-mirrorlist-*.pkg.tar.zst>",
+             repo = cfg.repo_name);
+    println!("#   sudo pacman -U <URL of {repo}-keyring-*.pkg.tar.zst>",
+             repo = cfg.repo_name);
+}
+
+/// `paur-cli keyring-build` — build and publish the `paur-keyring`
+/// and `paur-mirrorlist` meta-packages. After this command, a
+/// client can install both with `pacman -U` and never has to know
+/// the GPG fingerprint manually.
+pub async fn keyring_build(cfg: &Config) -> Result<(), CmdError> {
+    cfg.ensure_dirs()?;
+
+    let db = open_db(cfg).await?;
+    let keyid = db
+        .get_setting("gpg_key_id")
+        .await?
+        .ok_or_else(|| CmdError::Other(
+            "gpg_key_id not set; run `paur init` first".into(),
+        ))?;
+
+    // Build the two meta-packages sequentially. We don't bother
+    // parallelizing — each build is ~10s, and the user runs this
+    // command rarely.
+    let keyring_path = build_meta_package(cfg, "paur-keyring").await?;
+    let mirrorlist_path = build_meta_package(cfg, "paur-mirrorlist").await?;
+
+    // Publish both. `paur_repo::publish` copies them into the repo
+    // arch dir, runs `repo-add`, and signs with the daemon's key.
+    let repo = paur_daemon::build_repo_ctx(cfg, &db).await?;
+    let res1 = paur_repo::publish(&repo, &[keyring_path])
+        .await
+        .map_err(|e| CmdError::Other(format!("publish paur-keyring: {e}")))?;
+    println!("published paur-keyring; db sig: {}", res1.display());
+    let res2 = paur_repo::publish(&repo, &[mirrorlist_path])
+        .await
+        .map_err(|e| CmdError::Other(format!("publish paur-mirrorlist: {e}")))?;
+    println!("published paur-mirrorlist; db sig: {}", res2.display());
+    println!("\nClients can now install with:");
+    println!("  sudo pacman -U {}/{}-keyring-*.pkg.tar.zst",
+             cfg.public_base_url.trim_end_matches('/'),
+             cfg.repo_name);
+    println!("  sudo pacman -U {}/{}-mirrorlist-*.pkg.tar.zst",
+             cfg.public_base_url.trim_end_matches('/'),
+             cfg.repo_name);
+    let _ = keyid; // suppress unused; gpg_key comes via repo ctx
+    Ok(())
+}
+
+/// Build one meta-package via the local-build container path.
+/// Returns the on-disk `.pkg.tar.*` produced.
+async fn build_meta_package(
+    cfg: &Config,
+    label: &'static str,
+) -> Result<std::path::PathBuf, CmdError> {
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CmdError::Other(format!("tempdir: {e}")))?;
+    write_pkgbuild(tmp.path(), label, cfg)?;
+
+    let work_dir = cfg.work_dir.join(format!("keyring-{label}"));
+    let _ = std::fs::remove_dir_all(&work_dir);
+    std::fs::create_dir_all(&work_dir)?;
+
+    let req = paur_builder::LocalBuildRequest {
+        label: label.to_string(),
+        pkgbuild_dir: tmp.path().to_path_buf(),
+        work_dir,
+        ccache_dir: cfg.ccache_dir.clone(),
+        runtime: cfg.container_runtime,
+        image: cfg.builder_image.clone(),
+    };
+
+    let sink = std::sync::Arc::new(paur_builder::CollectingSink::default());
+    let outcome = paur_builder::run_local_in_container(&req, sink)
+        .await
+        .map_err(|e| CmdError::Other(format!("local build {label}: {e}")))?;
+    if outcome.exit_code != 0 {
+        return Err(CmdError::Other(format!(
+            "local build {label} exited {}",
+            outcome.exit_code
+        )));
+    }
+    let pkg = outcome.pkg_files.into_iter().next().ok_or_else(|| {
+        CmdError::Other(format!("local build {label} produced no artifact"))
+    })?;
+    Ok(pkg)
+}
+
+/// Write a PKGBUILD into `dir` for the given meta-package label.
+///
+/// For `paur-keyring` we also stage the pubkey as a sidecar file
+/// (named `paur.pubkey.asc` inside the pkgbuild dir) so the PKGBUILD
+/// can `cat` it into the package's `/usr/share/pacman/keyrings/`
+/// path. This avoids having to bind-mount the host's repo dir into
+/// the container — the package is fully self-contained.
+fn write_pkgbuild(
+    dir: &Path,
+    label: &'static str,
+    cfg: &Config,
+) -> Result<(), CmdError> {
+    let repo_name = cfg.repo_name.clone();
+    let base_url = cfg.public_base_url.trim_end_matches('/').to_string();
+
+    let contents = match label {
+        "paur-keyring" => {
+            // Stage the pubkey next to the PKGBUILD so the build
+            // script can install it without bind-mounting the host
+            // repo dir.
+            let pubkey_src = cfg.repo_dir.join(&cfg.arch).join("paur.pubkey.asc");
+            std::fs::copy(&pubkey_src, dir.join("paur.pubkey.asc")).map_err(|e| {
+                CmdError::Other(format!(
+                    "copy pubkey from {}: {e} (run `paur init` first?)",
+                    pubkey_src.display()
+                ))
+            })?;
+
+            format!(
+                r#"# Auto-generated by `paur-cli keyring-build`. Do not edit by hand.
+pkgname={repo_name}-keyring
+pkgver=1
+pkgrel=1
+pkgdesc="GPG keyring for the {repo_name} pacman repo"
+arch=('any')
+license=('GPL')
+
+package() {{
+    install -dm755 "$pkgdir/usr/share/pacman/keyrings/"
+    install -m0644 \
+        "$srcdir/paur.pubkey.asc" \
+        "$pkgdir/usr/share/pacman/keyrings/{repo_name}.asc"
+}}
+"#
+            )
+        }
+        "paur-mirrorlist" => format!(
+            r#"# Auto-generated by `paur-cli keyring-build`. Do not edit by hand.
+pkgname={repo_name}-mirrorlist
+pkgver=1
+pkgrel=1
+pkgdesc="Mirror list for the {repo_name} pacman repo"
+arch=('any')
+license=('GPL')
+
+package() {{
+    install -dm755 "$pkgdir/etc/pacman.d/"
+    cat > "$pkgdir/etc/pacman.d/{repo_name}-mirrorlist" <<'EOF'
+## {repo_name} pacman repository
+##
+## To enable, add to /etc/pacman.conf:
+##   [{repo_name}]
+##   Include = /etc/pacman.d/{repo_name}-mirrorlist
+##
+## This file is generated by paur and tracks your
+## configured public_base_url. Edit paur.toml and
+## re-run `paur-cli keyring-build` to update.
+
+[options]
+SigLevel = Optional TrustedOnly
+
+[{repo_name}]
+Server = {base_url}/$arch
+EOF
+}}
+"#
+        ),
+        other => {
+            return Err(CmdError::Other(format!(
+                "unknown meta-package label: {other}"
+            )));
+        }
+    };
+
+    std::fs::write(dir.join("PKGBUILD"), contents)
+        .map_err(|e| CmdError::Other(format!("write PKGBUILD: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,5 +751,55 @@ mod tests {
     fn print_pacman_conf_does_not_panic() {
         let cfg = Config::default();
         print_pacman_conf(&cfg);
+    }
+
+    /// `write_pkgbuild` lays out a self-contained PKGBUILD dir for
+    /// each meta-package. The keyring variant must copy the host's
+    /// `paur.pubkey.asc` next to the PKGBUILD so the container build
+    /// can `cat` it into the package without bind-mounts.
+    #[test]
+    fn write_pkgbuild_lays_out_keyring() {
+        let dir = tempdir().expect("tempdir");
+        // Create a fake pubkey at the expected host path.
+        let cfg = Config::with_data_dir(dir.path().to_path_buf());
+        let arch_dir = cfg.repo_dir.join(&cfg.arch);
+        std::fs::create_dir_all(&arch_dir).expect("arch dir");
+        std::fs::write(arch_dir.join("paur.pubkey.asc"), b"FAKE PGP KEY")
+            .expect("write pubkey");
+
+        let pkgbuild_dir = tempdir().expect("pkgbuild tempdir");
+        write_pkgbuild(pkgbuild_dir.path(), "paur-keyring", &cfg)
+            .expect("write keyring pkgbuild");
+
+        // The PKGBUILD should exist.
+        let pkgbuild = pkgbuild_dir.path().join("PKGBUILD");
+        let body = std::fs::read_to_string(&pkgbuild).expect("read PKGBUILD");
+        assert!(body.contains("pkgname=paur-keyring"));
+        assert!(body.contains("usr/share/pacman/keyrings/paur.asc"));
+
+        // The pubkey should be staged next to it.
+        let staged = pkgbuild_dir.path().join("paur.pubkey.asc");
+        let staged_bytes = std::fs::read(&staged).expect("read staged pubkey");
+        assert_eq!(staged_bytes, b"FAKE PGP KEY");
+    }
+
+    /// Mirrorlist PKGBUILD embeds the configured `public_base_url`
+    /// and the repo name into the package's mirrorlist file.
+    #[test]
+    fn write_pkgbuild_lays_out_mirrorlist() {
+        let dir = tempdir().expect("tempdir");
+        let mut cfg = Config::with_data_dir(dir.path().to_path_buf());
+        cfg.public_base_url = "https://paur.example".into();
+
+        let pkgbuild_dir = tempdir().expect("pkgbuild tempdir");
+        write_pkgbuild(pkgbuild_dir.path(), "paur-mirrorlist", &cfg)
+            .expect("write mirrorlist pkgbuild");
+
+        let body =
+            std::fs::read_to_string(pkgbuild_dir.path().join("PKGBUILD"))
+                .expect("read PKGBUILD");
+        assert!(body.contains("pkgname=paur-mirrorlist"));
+        assert!(body.contains("https://paur.example/$arch"));
+        assert!(body.contains("/etc/pacman.d/paur-mirrorlist"));
     }
 }
