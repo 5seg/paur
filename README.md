@@ -33,22 +33,26 @@ static bundle under `web/build/`.
 - `deploy/paur.toml.example` — sample config
 - `deploy/README.md` — install walkthrough
 
-## Quick start (local dev — no systemd, no paur user)
+## Quick start
 
-For a hands-on look at paur without setting up a system user, a
-systemd unit, or a builder image, run it from a temp dir as your
-normal user. This is enough to exercise the HTTP API, the Web UI,
-and the GPG key flow; **AUR builds still need Docker** and a real
-config in `~/.config/paur/`.
+Two roles, one README. Pick the one you want to do.
+
+### 1. Build host (the box that runs paur)
+
+For a hands-on look at paur without setting up a system user,
+a systemd unit, or a builder image, run it from a temp dir as
+your normal user. This is enough to exercise the HTTP API, the
+Web UI, and the GPG key flow; **AUR builds still need Docker**
+and `docker build -t paur-builder:latest container/`.
 
 ```sh
 # 1. Build
 cargo build --release --workspace
 (cd web && npm install && npm run build)
 
-# 2. Pick a sandbox data dir and let paur derive everything else.
-#    PAUR_DATA_DIR is honored by `Config::load` — it rewrites
-#    repo_dir, work_dir, ccache_dir, gpg_home, logs_dir.
+# 2. Pick a sandbox data dir. PAUR_DATA_DIR is honored by
+#    `Config::load` and rewrites repo_dir, work_dir, ccache_dir,
+#    gpg_home, logs_dir.
 export PAUR_DATA_DIR=$HOME/.local/share/paur-dev
 ./target/release/paur-cli init    # creates dirs, generates a GPG key
 
@@ -59,16 +63,46 @@ export PAUR_DATA_DIR=$HOME/.local/share/paur-dev
 ./target/release/paur-cli add hello
 ./target/release/paur-cli list
 ./target/release/paur-cli status hello
-# (The build will fail without `docker build -t paur-builder:latest container/`,
+# (The build fails without `docker build -t paur-builder:latest container/`,
 #  but the API roundtrip and GPG signing are visible.)
 
 # 5. Or open the Web UI
 xdg-open http://127.0.0.1:7300/
 ```
 
-`deploy/README.md` covers the **production** install — creating a
-dedicated `paur` system user, the systemd unit, Caddy in front,
-and the Chaotic-style `keyring-build` flow for clients.
+For a **production** install (systemd unit, `paur` system user,
+Caddy in front, exposing the repo to other machines), see
+`deploy/README.md`.
+
+### 2. Client (the box that does `pacman -Sy <pkg>`)
+
+Replace `paur.example` with the hostname your paur server is
+reachable at, and the file names with whatever `paur-cli
+keyring-build` printed on the server.
+
+```sh
+# 1. Trust the keyring and install the mirrorlist.
+#    These two packages are built once on the server and don't
+#    change often; re-run only when the server is re-keyed or
+#    its URL moves.
+sudo pacman -U 'https://paur.example/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
+sudo pacman -U 'https://paur.example/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
+
+# 2. Add the repo to pacman.conf.
+sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
+[paur]
+Include = /etc/pacman.d/paur-mirrorlist
+EOF
+
+# 3. Sync and install
+sudo pacman -Sy hello-pkg
+```
+
+No `pacman-key --recv-keys`. No `--lsign-key`. No manual
+fingerprint copy-paste. The keyring package places the pubkey
+at the standard `/usr/share/pacman/keyrings/paur.asc` path;
+pacman trusts it automatically when the `[paur]` section is
+enabled.
 
 ## Testing
 
