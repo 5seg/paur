@@ -16,7 +16,14 @@
 #
 # This config assumes the daemon is listening on 127.0.0.1:7300
 # (axum 0.7's TCP fallback) and the static UI is at
-# /var/lib/paur/web (written there by `web/build`).
+# <data_dir>/web/build (typically the result of `npm run build`).
+#
+# Usage:
+#   /etc/caddy/Caddyfile:
+#       import /etc/caddy/Caddyfile.d/*
+#
+#   /etc/caddy/Caddyfile.d/paur:   # this file
+#       (after editing the hostnames and the `root` path)
 
 {
     # TLS is handled in front of Caddy; do not attempt ACME.
@@ -28,22 +35,17 @@
     }
 }
 
-# Single site. Replace `paur.5seg.top` with your hostname, then
-# point the upstream TLS terminator at this Caddy on :80.
-http://paur.5seg.top {
-    root * /var/lib/paur/web
+# Replace `paur.5seg.top` with your hostname. The other two are
+# conveniences for testing directly on the build host.
+http://paur.5seg.top, http://localhost, http://xserver {
+    # Where the SvelteKit `npm run build` output lives. Must be
+    # readable by the caddy user (typically 0755 directories,
+    # 0644 files). If you place the build under `/home/<user>/...`,
+    # also `chmod o+x /home/<user>` so the caddy user can traverse
+    # to the build directory.
+    root * /home/user/paur/web/build
 
     encode zstd gzip
-
-    # Strip the public Host header from the upstream so the daemon
-    # sees a clean `Host:` line (some reverse proxies preserve the
-    # original; this normalises it).
-    header_up Host {host}
-
-    # Real client IP: forward the value the upstream TLS proxy put
-    # in `X-Forwarded-For`. If your proxy uses a different header
-    # (e.g. `CF-Connecting-IP`), swap it in.
-    header_up X-Real-IP {remote_host}
 
     # Static repo files first — these are the actual packages and
     # DB that `pacman -Sy` fetches. Short caching so a fresh build
@@ -69,21 +71,24 @@ http://paur.5seg.top {
         }
     }
 
-    # Anything that isn't a static repo file or an API call is
-    # served by the daemon (SPA + dynamic UI API routes). Same
-    # transport settings as the API path.
-    reverse_proxy 127.0.0.1:7300 {
-        transport http {
-            dial_timeout 5s
-            response_header_timeout 1h
-        }
+    # SvelteKit static assets — hashed bundle files under /_app,
+    # favicon, etc. List any top-level asset directories the build
+    # emits here. Anything not in this list and not /repo/* or
+    # /api/* falls through to the SPA fallback below.
+    @spaAssets path /_app/* /favicon.ico /assets/*
+    handle @spaAssets {
+        file_server
     }
 
-    # Static UI assets.
-    file_server
-    # SPA fallback: send anything else to the SvelteKit index.html
-    # so client-side routing works on hard refresh.
-    try_files {path} {path}.html /index.html
+    # SPA fallback: anything that isn't a real asset, repo file,
+    # or API call gets rewritten to /index.html so SvelteKit's
+    # client-side router can take over. This is what makes
+    # `https://paur.5seg.top/packages/<name>` work on hard reload.
+    @spaFallback not path /repo/* /api/* /_app/* /favicon.ico /assets/*
+    handle @spaFallback {
+        rewrite * /index.html
+        file_server
+    }
 }
 
 # Optional: a tiny health endpoint reachable directly on the box

@@ -9,6 +9,11 @@
 # Adjust `root` and the bind address to taste. This config assumes
 # the daemon is listening on the loopback fallback (127.0.0.1:7300)
 # since axum 0.7 doesn't accept a unix listener.
+#
+# If you'd rather terminate TLS in front of Caddy (Cloudflare, an
+# internal proxy, etc.), use `deploy/Caddyfile.public` instead —
+# this file expects Caddy to fetch and renew its own Let's Encrypt
+# certs on :443.
 
 {
     # auto_https off if you'd rather terminate TLS yourself.
@@ -17,6 +22,11 @@
 
 # Primary site. Replace `paur.example` with your hostname.
 paur.example, https://paur.example {
+    # Where the SvelteKit `npm run build` output lives. Must be
+    # readable by the caddy user (typically 0755 directories,
+    # 0644 files). If you place the build under `/home/<user>/...`,
+    # also `chmod o+x /home/<user>` so the caddy user can traverse
+    # to the build directory.
     root * /var/lib/paur/web
 
     encode zstd gzip
@@ -38,24 +48,30 @@ paur.example, https://paur.example {
         reverse_proxy 127.0.0.1:7300 {
             header_up Host {host}
             header_up X-Real-IP {remote_host}
+            transport http {
+                dial_timeout 5s
+                # SSE log streams live up to an hour; don't time out.
+                response_header_timeout 1h
+            }
         }
     }
 
-    # SSE needs long-lived connections; Caddy's defaults are fine,
-    # but be explicit about timeouts so the UI's log-stream doesn't
-    # get cut off.
-    reverse_proxy 127.0.0.1:7300 {
-        header_up Host {host}
-        header_up X-Real-IP {remote_host}
-        transport http {
-            dial_timeout 5s
-            response_header_timeout 1h
-        }
+    # SvelteKit static assets — hashed bundle files under /_app,
+    # favicon, etc. List any top-level asset directories the build
+    # emits here. Anything not in this list and not /repo/* or
+    # /api/* falls through to the SPA fallback below.
+    @spaAssets path /_app/* /favicon.ico /assets/*
+    handle @spaAssets {
+        file_server
     }
 
-    # Static UI assets.
-    file_server
-    # SPA fallback: send anything else to the SvelteKit index.html
-    # so client-side routing works on hard refresh.
-    try_files {path} {path}.html /index.html
+    # SPA fallback: anything that isn't a real asset, repo file,
+    # or API call gets rewritten to /index.html so SvelteKit's
+    # client-side router can take over. This is what makes
+    # `https://paur.example/packages/<name>` work on hard reload.
+    @spaFallback not path /repo/* /api/* /_app/* /favicon.ico /assets/*
+    handle @spaFallback {
+        rewrite * /index.html
+        file_server
+    }
 }
