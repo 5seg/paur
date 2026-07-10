@@ -1,0 +1,94 @@
+# Caddyfile for paur, public deployment.
+#
+# Use this when you want to publish paur at a public hostname
+# (e.g. paur.5seg.top) but terminate TLS elsewhere — Cloudflare in
+# front, a corporate proxy, an internal CA, etc. Caddy is acting
+# as a plain HTTP reverse proxy on the loopback side.
+#
+# If you'd rather have Caddy fetch and renew Let's Encrypt certs
+# itself, use the stock `deploy/Caddyfile` instead.
+#
+# Layout (after DNS + TLS termination lands):
+#   /                 → static SvelteKit UI (built into web/build/)
+#   /api/v1/*         → the daemon's HTTP API
+#   /repo/$arch/*     → the published pacman repo (signed .pkg.tar.zst,
+#                      paur.db.tar.gz, .sig, paur.pubkey.asc)
+#
+# This config assumes the daemon is listening on 127.0.0.1:7300
+# (axum 0.7's TCP fallback) and the static UI is at
+# /var/lib/paur/web (written there by `web/build`).
+
+{
+    # TLS is handled in front of Caddy; do not attempt ACME.
+    auto_https off
+    # When TLS is off, `servers` cannot bind to :443 — bind :80 only
+    # and let the upstream reverse proxy forward to us.
+    servers {
+        protocols h1 h2c
+    }
+}
+
+# Single site. Replace `paur.5seg.top` with your hostname, then
+# point the upstream TLS terminator at this Caddy on :80.
+http://paur.5seg.top {
+    root * /var/lib/paur/web
+
+    encode zstd gzip
+
+    # Strip the public Host header from the upstream so the daemon
+    # sees a clean `Host:` line (some reverse proxies preserve the
+    # original; this normalises it).
+    header_up Host {host}
+
+    # Real client IP: forward the value the upstream TLS proxy put
+    # in `X-Forwarded-For`. If your proxy uses a different header
+    # (e.g. `CF-Connecting-IP`), swap it in.
+    header_up X-Real-IP {remote_host}
+
+    # Static repo files first — these are the actual packages and
+    # DB that `pacman -Sy` fetches. Short caching so a fresh build
+    # is visible after the next `pacman -Sy`.
+    @repo path /repo/*
+    handle @repo {
+        root * /var/lib/paur/repo
+        file_server
+        header Cache-Control "no-cache, must-revalidate"
+    }
+
+    # Daemon HTTP API. The SvelteKit UI talks to this through the
+    # Vite dev proxy in dev, and through this reverse proxy in
+    # production.
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:7300 {
+            transport http {
+                dial_timeout 5s
+                # SSE log streams live up to an hour; don't time out.
+                response_header_timeout 1h
+            }
+        }
+    }
+
+    # Anything that isn't a static repo file or an API call is
+    # served by the daemon (SPA + dynamic UI API routes). Same
+    # transport settings as the API path.
+    reverse_proxy 127.0.0.1:7300 {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 1h
+        }
+    }
+
+    # Static UI assets.
+    file_server
+    # SPA fallback: send anything else to the SvelteKit index.html
+    # so client-side routing works on hard refresh.
+    try_files {path} {path}.html /index.html
+}
+
+# Optional: a tiny health endpoint reachable directly on the box
+# without going through the public proxy. Useful for `paur-cli
+# doctor` from the host itself.
+:8080/health {
+    reverse_proxy 127.0.0.1:7300
+}

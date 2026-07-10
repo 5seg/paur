@@ -29,9 +29,14 @@ static bundle under `web/build/`.
 
 - `container/Dockerfile` — builder image (`paur-builder:latest`)
 - `deploy/Caddyfile` — reverse proxy + static repo + static UI
+  (Caddy fetches its own Let's Encrypt cert)
+- `deploy/Caddyfile.public` — same routing, **no TLS**; use when
+  you terminate TLS in front (Cloudflare, an internal proxy, etc.)
 - `deploy/paur.service` — systemd unit
 - `deploy/paur.toml.example` — sample config
-- `deploy/README.md` — install walkthrough
+- `deploy/README.md` — install walkthrough (Arch host)
+- `deploy/README.linux.md` — install walkthrough (Ubuntu / Debian /
+  RHEL / Fedora, with a public hostname like `paur.5seg.top`)
 
 ## Quick start
 
