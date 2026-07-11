@@ -19,7 +19,6 @@
   async function loadInitial() {
     try {
       build = await api.getBuild(id);
-      // Pre-fill with the cached log, if any.
       try {
         const cached = await api.rawLogs(id);
         if (cached) logLines = cached.split('\n');
@@ -43,14 +42,9 @@
       streaming = false;
       es?.close();
       es = null;
-      // Refresh the build row to pick up the final status.
       loadInitial();
     });
     es.onerror = () => {
-      // SSE errored (most often: build not running, channel closed).
-      // The server also sends a single 'done' event when the stream
-      // ends, so we just stop streaming and let the user click
-      // "Refresh" to fetch the final cached log.
       streaming = false;
       es?.close();
       es = null;
@@ -64,33 +58,31 @@
 
   onDestroy(() => {
     es?.close();
+    es = null;
   });
 
   async function refresh() {
     await loadInitial();
-    if (!streaming) startStream();
   }
 </script>
 
 <div class="mb-4 flex items-center gap-3">
-  <a class="text-sm text-blue-700 hover:underline dark:text-blue-400" href="/queue">← back</a>
-  <h1 class="text-2xl font-semibold">
+  <a href="/queue" class="text-sm" style="color: var(--body);">← back</a>
+  <h1 class="text-2xl font-semibold tracking-tight" style="color: var(--ink);">
     {#if build}build #{build.seq}{:else}Build #{id}{/if}
   </h1>
   {#if build}
     <StatusBadge status={build.status} />
-    <span class="text-sm text-gray-500 dark:text-slate-400">trigger: {build.trigger}</span>
+    <span class="text-sm" style="color: var(--mute);">trigger: {build.trigger}</span>
   {/if}
-  <div class="ml-auto space-x-2">
+  <div class="ml-auto flex items-center gap-3">
     <button class="btn" onclick={refresh}>Refresh</button>
-    <span class="text-xs text-gray-500 dark:text-slate-400">
-      {streaming ? 'live' : 'cached'}
-    </span>
+    <span class="text-xs" style="color: var(--mute);">{streaming ? 'live' : 'cached'}</span>
   </div>
 </div>
 
 {#if error}
-  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+  <div class="mb-6 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm" style="color: var(--error);">
     {error}
   </div>
 {/if}
@@ -99,24 +91,49 @@
   {#if build.status === 'running'}
     <div class="progress-bar mb-4"></div>
   {/if}
-  <div class="mb-4 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-    <div><span class="text-gray-500 dark:text-slate-400">queued:</span> {fmtTs(build.queued_at)}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">started:</span> {fmtTs(build.started_at)}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">finished:</span> {fmtTs(build.finished_at)}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">exit:</span> {build.exit_code ?? '-'}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">version:</span> {build.pkg_version ?? '-'}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">file:</span> {build.pkg_file ?? '-'}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">worker:</span> {build.worker_id ?? '-'}</div>
-    <div><span class="text-gray-500 dark:text-slate-400">trigger:</span> {build.trigger}</div>
+
+  <div class="card-vercel mb-6 grid grid-cols-2 gap-4 p-4 text-sm md:grid-cols-4">
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">queued</div>
+      <div style="color: var(--body);">{fmtTs(build.queued_at)}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">started</div>
+      <div style="color: var(--body);">{fmtTs(build.started_at)}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">finished</div>
+      <div style="color: var(--body);">{fmtTs(build.finished_at)}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">exit</div>
+      <div style="color: var(--body);">{build.exit_code ?? '—'}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">version</div>
+      <div class="font-mono" style="color: var(--body);">{build.pkg_version ?? '—'}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">file</div>
+      <div class="font-mono" style="color: var(--body);">{build.pkg_file ?? '—'}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">worker</div>
+      <div class="font-mono" style="color: var(--body);">{build.worker_id ?? '—'}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">trigger</div>
+      <div style="color: var(--body);">{build.trigger}</div>
+    </div>
   </div>
 {/if}
 
 <div bind:this={logEl} class="log-view">
   {#if logLines.length === 0}
-    <div class="text-gray-500 dark:text-slate-400">No log lines yet…</div>
+    <div style="color: var(--mute);">No log lines yet…</div>
   {:else}
-    {#each logLines as line, i (i)}
-      <div>{line}</div>
+    {#each logLines as line}
+      <div class="whitespace-pre-wrap leading-relaxed">{line}</div>
     {/each}
   {/if}
 </div>

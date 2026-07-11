@@ -21,25 +21,25 @@
   }
 </script>
 
-<h1 class="text-2xl font-semibold mb-6">GPG public key</h1>
+<h1 class="mb-6 text-2xl font-semibold tracking-tight" style="color: var(--ink);">GPG public key</h1>
 
-<p class="text-sm text-gray-700 mb-3 dark:text-slate-300">
+<p class="mb-3 text-sm" style="color: var(--body);">
   Add this key to your client's trust store. The exact commands differ by
   distribution; on Arch:
 </p>
 
-<pre class="rounded-md border border-gray-300 bg-gray-900 p-3 text-xs text-gray-100 overflow-x-auto dark:border-slate-800 dark:bg-black/40 dark:text-slate-300">
+<pre class="overflow-x-auto rounded-lg border p-3 text-xs" style="background: var(--bg-card); border-color: var(--hairline); color: var(--body);">
 sudo pacman-key --recv-keys &lt;keyid&gt;
 sudo pacman-key --lsign-key &lt;keyid&gt;</pre>
 
 {#if error}
-  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 mt-4 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+  <div class="mb-6 mt-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm" style="color: var(--error);">
     {error}
   </div>
 {/if}
 
 {#if loading}
-  <p class="text-gray-500 mt-4 dark:text-slate-400">Loading…</p>
+  <p class="mt-4" style="color: var(--mute);">Loading…</p>
 {:else}
   <div class="mt-4 flex items-start gap-3">
     <pre class="log-view flex-1 whitespace-pre">{key}</pre>

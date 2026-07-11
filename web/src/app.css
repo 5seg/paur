@@ -2,13 +2,32 @@
 @tailwind components;
 @tailwind utilities;
 
-/* paur: a couple of small bespoke styles. Tailwind utilities cover
-   the rest. */
-
 @layer base {
+  :root {
+    --bg-page: #0a0a0b;
+    --bg-card: #111113;
+    --bg-card-hover: #18181b;
+    --bg-soft: #18181b;
+    --bg-elevated: #1c1c1f;
+    --hairline: #1f1f23;
+    --hairline-strong: #3f3f46;
+    --ink: #fafafa;
+    --body: #a1a1aa;
+    --mute: #71717a;
+    --accent: #0070f3;
+    --accent-soft: rgba(0, 112, 243, 0.06);
+    --success: #22c55e;
+    --error: #ef4444;
+    --warning: #f59e0b;
+  }
+
   body {
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-      'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+      'Helvetica Neue', Arial, sans-serif;
+    background-color: var(--bg-page);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -21,64 +40,114 @@
 }
 
 @layer components {
+  .card-vercel {
+    background: var(--bg-card);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.03),
+      0 1px 1px rgba(0, 0, 0, 0.3),
+      0 2px 2px rgba(0, 0, 0, 0.15);
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+  }
+  .card-vercel:hover {
+    border-color: var(--hairline-strong);
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.05),
+      0 2px 2px rgba(0, 0, 0, 0.3),
+      0 4px 4px rgba(0, 0, 0, 0.15);
+  }
+
   .btn {
-    @apply inline-flex items-center gap-1 rounded-md border border-gray-300
-           bg-white px-3 py-1.5 text-sm font-medium text-gray-700
-           shadow-sm hover:bg-gray-50 focus:outline-none
-           focus:ring-2 focus:ring-blue-500 focus:ring-offset-1
-           disabled:opacity-50 disabled:cursor-not-allowed
-           dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200
-           dark:hover:bg-slate-700 dark:focus:ring-offset-slate-900;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium;
+    background: var(--bg-elevated);
+    border: 1px solid var(--hairline);
+    color: var(--ink);
+    transition: background 150ms ease, border-color 150ms ease;
+  }
+  .btn:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--hairline-strong);
   }
   .btn-primary {
-    @apply border-transparent bg-blue-600 text-white hover:bg-blue-700
-           dark:bg-blue-600 dark:hover:bg-blue-500;
+    @apply rounded-full px-4 py-1.5 text-sm font-medium;
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover {
+    background: #0060df;
+    border-color: #0060df;
   }
   .btn-danger {
-    @apply border-transparent bg-red-600 text-white hover:bg-red-700
-           dark:bg-red-700 dark:hover:bg-red-600;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: var(--error);
   }
+  .btn-danger:hover {
+    background: rgba(239, 68, 68, 0.25);
+    border-color: rgba(239, 68, 68, 0.5);
+  }
+
   .badge {
-    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs
-           font-medium dark:bg-slate-700 dark:text-slate-200;
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
   }
-  .badge-queued { @apply bg-gray-200 text-gray-800 dark:bg-slate-700/60 dark:text-slate-300; }
-  .badge-running { @apply bg-blue-100 text-blue-800 dark:bg-blue-500/15 dark:text-blue-300; }
-  .badge-success { @apply bg-green-100 text-green-800 dark:bg-green-500/15 dark:text-green-300; }
-  .badge-failed { @apply bg-red-100 text-red-800 dark:bg-red-500/15 dark:text-red-300; }
-  .badge-cancelled { @apply bg-gray-200 text-gray-600 dark:bg-slate-700/40 dark:text-slate-400; }
+  .badge-queued { @apply bg-gray-800 text-gray-300; }
+  .badge-running { @apply bg-blue-500/15 text-blue-300; }
+  .badge-success { @apply bg-green-500/15 text-green-300; }
+  .badge-failed { @apply bg-red-500/15 text-red-300; }
+  .badge-cancelled { @apply bg-gray-800 text-gray-400; }
+
   .table-base {
-    @apply min-w-full divide-y divide-gray-200 text-sm dark:divide-slate-800;
+    @apply w-full text-sm;
   }
   .table-base th {
-    @apply bg-gray-50 px-3 py-2 text-left text-xs font-semibold
-           uppercase tracking-wider text-gray-600
-           dark:bg-slate-800/50 dark:text-slate-400;
+    @apply px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wider;
+    color: var(--mute);
   }
   .table-base td {
-    @apply whitespace-nowrap px-3 py-2 text-gray-800 dark:text-slate-200;
+    @apply whitespace-nowrap px-4 py-3;
+    color: var(--body);
+    border-top: 1px solid var(--hairline);
   }
+  .table-base tr:first-child td {
+    border-top: none;
+  }
+  .table-base tr:hover td {
+    background: var(--bg-card-hover);
+  }
+
   .log-view {
-    @apply h-[60vh] overflow-y-auto rounded-md border border-gray-300
-           bg-gray-900 p-3 font-mono text-xs text-gray-100
-           dark:border-slate-800 dark:bg-black/40 dark:text-slate-300;
+    @apply h-[60vh] overflow-y-auto rounded-lg p-4 font-mono text-xs;
+    background: #000;
+    border: 1px solid var(--hairline);
+    color: var(--body);
   }
 
   .progress-bar {
-    @apply relative h-1.5 w-full overflow-hidden rounded-full bg-slate-200
-           dark:bg-slate-800;
+    @apply relative h-1 w-full overflow-hidden rounded-full;
+    background: var(--hairline);
   }
   .progress-bar::after {
-    @apply absolute inset-y-0 left-0 w-1/4 rounded-full bg-blue-500
-           animate-indeterminate-bar content-[''];
+    @apply absolute inset-y-0 left-0 w-1/4 rounded-full content-[''];
+    background: var(--accent);
+    animation: indeterminate-bar 1.4s ease-in-out infinite;
   }
 
   .status-dot {
-    @apply inline-block h-1.5 w-1.5 rounded-full;
+    @apply inline-block h-2 w-2 rounded-full;
   }
   .status-dot-queued    { @apply bg-paur-queued; }
   .status-dot-running   { @apply bg-paur-running animate-pulse-dot; }
   .status-dot-success   { @apply bg-paur-success; }
   .status-dot-failed    { @apply bg-paur-failed; }
   .status-dot-cancelled { @apply bg-paur-cancelled; }
+
+  .link-vercel {
+    color: var(--body);
+    transition: color 150ms ease;
+  }
+  .link-vercel:hover {
+    color: var(--accent);
+  }
 }

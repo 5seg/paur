@@ -27,40 +27,42 @@
   });
 </script>
 
-<h1 class="text-2xl font-semibold mb-6">Sign in</h1>
+<h1 class="mb-6 text-2xl font-semibold tracking-tight" style="color: var(--ink);">Sign in</h1>
 
-<div class="max-w-sm rounded-md border border-gray-200 bg-white p-6 dark:border-slate-800 dark:bg-slate-900">
+<div class="card-vercel max-w-sm p-6">
   {#if !$authState.passwordSet}
-    <div class="mb-4 rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
+    <div class="mb-4 rounded border p-3 text-sm" style="background: rgba(245, 158, 11, 0.1); border-color: rgba(245, 158, 11, 0.3); color: var(--warning);">
       No admin password is set on the host. Run
-      <code class="rounded bg-amber-100 px-1 dark:bg-amber-500/20 dark:text-amber-200">paur passwd</code> on the build host to
+      <code class="rounded px-1" style="background: rgba(245, 158, 11, 0.15);">paur passwd</code> on the build host to
       create one, then refresh this page.
     </div>
   {/if}
 
   <form onsubmit={submit} class="space-y-4">
     <label class="block">
-      <span class="text-xs font-medium text-gray-700 dark:text-slate-300">Username</span>
+      <span class="text-xs font-medium" style="color: var(--body);">Username</span>
       <input
         type="text"
         bind:value={username}
-        class="mt-1 block w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        class="mt-1 block w-full rounded-md border px-2 py-1.5 text-sm"
+        style="background: var(--bg-page); border-color: var(--hairline); color: var(--ink);"
         required
         autocomplete="username"
       />
     </label>
     <label class="block">
-      <span class="text-xs font-medium text-gray-700 dark:text-slate-300">Password</span>
+      <span class="text-xs font-medium" style="color: var(--body);">Password</span>
       <input
         type="password"
         bind:value={password}
-        class="mt-1 block w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        class="mt-1 block w-full rounded-md border px-2 py-1.5 text-sm"
+        style="background: var(--bg-page); border-color: var(--hairline); color: var(--ink);"
         required
         autocomplete="current-password"
       />
     </label>
     {#if error}
-      <div class="text-sm text-red-700 dark:text-red-400">{error}</div>
+      <div class="text-sm" style="color: var(--error);">{error}</div>
     {/if}
     <button
       type="submit"
