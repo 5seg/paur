@@ -1,15 +1,13 @@
 <script lang="ts">
-  // Install page. Renders four copy-pasteable blocks for a fresh
-  // Arch client: (0) find the FPR, (1) bootstrap the GPG key,
-  // (2) install the keyring + mirrorlist meta-packages, (3) enable
-  // the repo in pacman.conf. The hostname defaults to the browser's
-  // current host, so the rendered commands "just work" for almost
-  // every deployment.
+  // Install page. A single copy-pasteable bootstrap for a fresh
+  // Arch client. The host is auto-filled from `location.host` so
+  // the rendered script "just works" for almost every deployment;
+  // edit it if the client is on a different network.
   //
-  // The shape mirrors chaotic-aur's docs (https://aur.chaotic.cx/),
-  // but we extract the FPR on the client side via the same
-  // `gpg --import-options show-only --import` flow rather than
-  // relying on a public keyserver.
+  // The four logical steps (find FPR, bootstrap key, install
+  // keyring + mirrorlist, enable repo) are kept inline as a single
+  // bash script rather than split into per-step blocks — chaotic's
+  // docs do the same.
 
   import { onMount } from 'svelte';
 
@@ -17,7 +15,7 @@
   let arch = $state('x86_64');
   let fpr = $state<string | null>(null);
   let fprError = $state<string | null>(null);
-  let copiedBlock = $state<number | null>(null);
+  let copied = $state(false);
 
   onMount(() => {
     host = location.host;
@@ -25,14 +23,15 @@
 
   // Server-side FPR helper. Avoids shipping a PGP parser in the UI
   // bundle: the daemon already has GPG on PATH (it signs repo DBs
-  // with it), so we just ask it to parse its own pubkey. If the
-  // daemon is older than this endpoint, we fall back to the
-  // client-side FPR extraction in block 0.
+  // with it), so we just ask it to parse its own pubkey. The
+  // script below does the same parse client-side, so this button
+  // is purely a convenience for users who'd rather read the FPR
+  // than copy block 1.
   async function fetchFpr() {
     try {
       const r = await fetch(`/api/v1/install/fpr?host=${encodeURIComponent(host)}`);
       if (!r.ok) {
-        fprError = `fpr endpoint returned ${r.status}; copy block 0 verbatim instead`;
+        fprError = `fpr endpoint returned ${r.status}; the script below extracts it client-side instead`;
         return;
       }
       const j = (await r.json()) as { fpr: string };
@@ -42,71 +41,42 @@
     }
   }
 
-  const repoRoot = $derived(`${location.protocol}//${host}/repo/${arch}`);
+  const script = $derived(
+    `# Bootstrap an Arch client against this paur server.
 
-  function block(n: number, title: string, cmd: string) {
-    return { n, title, cmd };
-  }
-
-  const blocks = $derived([
-    // 0. Find the FPR. We can do this client-side via the same
-    //    `gpg --import-options show-only --import` the README
-    //    documents, OR we can have the daemon do it for us (the
-    //    "Resolve FPR server-side" button above). We default to
-    //    the client-side flow so the copy-paste works without a
-    //    click first.
-    block(
-      0,
-      'Find the FPR',
-      `# Find this server's GPG fingerprint (40 hex chars)
-FPR=$(curl -sSL ${repoRoot}/paur.pubkey.asc \\
+# 1. Find this server's GPG fingerprint.
+FPR=$(curl -sSL ${`${location.protocol}//${host}/repo/${arch}`}/paur.pubkey.asc \\
         | gpg --import-options show-only --import 2>/dev/null \\
         | awk '/^pub/{print $2}' | head -1 | cut -d/ -f2)
-echo "$FPR"`
-    ),
-    // 1. Bootstrap: add the pubkey to the local keyring and lsign
-    //    it. pacman-key --lsign-key prompts for the local keyring's
-    //    passphrase, which defaults to empty on a fresh install.
-    block(
-      1,
-      'Bootstrap GPG key',
-      `# Bootstrap: add the pubkey to the local keyring and lsign it.
-sudo pacman-key --add <(curl -sSL ${repoRoot}/paur.pubkey.asc)
-sudo pacman-key --lsign-key "$FPR"`
-    ),
-    // 2. Install the keyring + mirrorlist meta-packages. The
-    //    post-install hook on `paur-keyring` runs
-    //    `pacman-key --populate paur`, which re-imports the
-    //    pubkey and lsigns every FPR in `paur-trusted` at full
-    //    trust.
-    block(
-      2,
-      'Install keyring + mirrorlist',
-      `# Install the keyring + mirrorlist meta-packages.
-sudo pacman -U --noconfirm '${repoRoot}/paur-keyring-1-1-any.pkg.tar.zst'
-sudo pacman -U --noconfirm '${repoRoot}/paur-mirrorlist-1-1-any.pkg.tar.zst'`
-    ),
-    // 3. Enable the repo + first sync.
-    block(
-      3,
-      'Enable in pacman.conf',
-      `# Enable the repo in pacman.conf.
+echo "FPR=$FPR"
+
+# 2. Bootstrap: add the pubkey to the local keyring and lsign it.
+#    --lsign-key prompts for the local keyring's passphrase,
+#    which defaults to empty on a fresh install.
+sudo pacman-key --add <(curl -sSL ${`${location.protocol}//${host}/repo/${arch}`}/paur.pubkey.asc)
+sudo pacman-key --lsign-key "$FPR"
+
+# 3. Install the keyring + mirrorlist meta-packages. The
+#    post-install hook on \`paur-keyring\` runs
+#    \`pacman-key --populate paur\`, which re-imports the pubkey
+#    and lsigns every FPR in \`paur-trusted\` at full trust.
+sudo pacman -U --noconfirm '${`${location.protocol}//${host}/repo/${arch}`}/paur-keyring-1-1-any.pkg.tar.zst'
+sudo pacman -U --noconfirm '${`${location.protocol}//${host}/repo/${arch}`}/paur-mirrorlist-1-1-any.pkg.tar.zst'
+
+# 4. Enable the repo in pacman.conf and sync.
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
 Include = /etc/pacman.d/paur-mirrorlist
 EOF
-
-# Sync and install.
 sudo pacman -Sy hello-pkg`
-    )
-  ]);
+  );
 
-  async function copy(n: number, text: string) {
+  async function copy() {
     try {
-      await navigator.clipboard.writeText(text);
-      copiedBlock = n;
+      await navigator.clipboard.writeText(script);
+      copied = true;
       setTimeout(() => {
-        if (copiedBlock === n) copiedBlock = null;
+        copied = false;
       }, 1500);
     } catch {
       // Best-effort: if clipboard is denied (insecure context),
@@ -158,32 +128,21 @@ sudo pacman -Sy hello-pkg`
   {/if}
 </div>
 
-<div class="space-y-2">
-  {#each blocks as b (b.n)}
-    <div class="rounded-md border p-3" style="background: var(--bg-card); border-color: var(--hairline);">
-      <div class="mb-2 flex items-center justify-between">
-        <span class="text-[11px] uppercase tracking-wide" style="color: var(--mute);">{#if b.title}{b.title}{/if}</span>
-        <button
-          class="btn"
-          type="button"
-          onclick={() => copy(b.n, b.cmd)}
-        >
-          {copiedBlock === b.n ? 'Copied' : 'Copy'}
-        </button>
-      </div>
-      <pre class="log-view overflow-x-auto whitespace-pre text-xs" style="color: var(--body);">{b.cmd}</pre>
-    </div>
-  {/each}
+<div class="rounded-md border p-3" style="background: var(--bg-card); border-color: var(--hairline);">
+  <div class="mb-2 flex justify-end">
+    <button class="btn" type="button" onclick={copy}>
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  </div>
+  <pre class="log-view overflow-x-auto whitespace-pre text-xs" style="color: var(--body);">{script}</pre>
 </div>
 
-<div class="mt-8 text-xs" style="color: var(--mute);">
+<p class="mt-4 text-xs" style="color: var(--mute);">
   paur's GPG key is generated locally on the server and is not
-  published to any keyserver, so the very first <code>pacman -U</code>
-  cannot validate the keyring package's signature until you've
-  manually added the key (step 1) and installed the keyring
-  package (step 2). After that, the keyring's post-install hook
-  re-imports the pubkey at full trust, so subsequent
-  <code>pacman -U</code> and <code>pacman -Sy</code> invocations
-  on <code>paur-*</code> packages are signature-validated
-  automatically.
-</div>
+  published to any keyserver, so the first <code>pacman -U</code>
+  can't validate the keyring package's signature until step 2
+  has run. After that, the keyring's post-install hook re-imports
+  the pubkey at full trust, so subsequent <code>pacman -U</code>
+  and <code>pacman -Sy</code> on <code>paur-*</code> packages are
+  signature-validated automatically.
+</p>
