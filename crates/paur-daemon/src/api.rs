@@ -451,7 +451,10 @@ async fn queue(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json:
 }
 
 async fn pubkey(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    let pubkey_path = state.repo.repo_dir.join("paur.pubkey.asc");
+    // The pubkey lives in the arch-specific dir, alongside the
+    // .pkg.tar.zst files, so it is colocated with the rest of the
+    // repo a client fetches. `paur-cli init` writes it there.
+    let pubkey_path = state.repo.arch_dir().join("paur.pubkey.asc");
     match std::fs::read(&pubkey_path) {
         Ok(b) => Ok((
             [(axum::http::header::CONTENT_TYPE, "application/pgp-keys")],

@@ -47,23 +47,25 @@
 # a Host matcher is the only form that handles every method on
 # every host we serve.
 :80 {
+    # Per-path routing. We use `handle_path` for the file-serving
+    # scopes because it strips the matched prefix from the request
+    # path before delegating, which makes it impossible to leak a
+    # parent-scope `root` into a child handle. `handle` + a child
+    # `root` *should* work, but in practice Caddy 2.6+'s
+    # `vars` semantics make it brittle when the parent also
+    # sets `root`; using `handle_path` with the root set in the
+    # same block is the bulletproof form.
     @hostnames host paur.example localhost xserver
-    handle @hostnames {
-        # Where the SvelteKit `npm run build` output lives. This
-        # directory is owned by the deployer (root or your user)
-        # and only ever written by the deploy step. The daemon
-        # never touches it; see the header comment for why we
-        # keep it separate from `repo/`. Must be readable by the
-        # caddy user (typically 0755 directories, 0644 files).
-        root * /var/lib/paur/webui
-
+    route @hostnames {
         encode zstd gzip
 
         # Static repo files first — these are the actual packages
         # and DB that `pacman -Sy` fetches. We set short caching
         # so a new build is visible after the next `pacman -Sy`.
-        @repo path /repo/*
-        handle @repo {
+        # `handle_path /repo` strips the /repo prefix from the
+        # request, so the inner file_server looks for
+        # `<root>/x86_64/<file>` directly.
+        handle_path /repo/* {
             root * /var/lib/paur/repo
             file_server
             header Cache-Control "no-cache, must-revalidate"
@@ -71,7 +73,10 @@
 
         # Daemon HTTP API (the SvelteKit UI talks to this through
         # the Vite dev proxy, and at runtime through this reverse
-        # proxy).
+        # proxy). We use `handle` (not `handle_path`) here so the
+        # full `/api/*` path is preserved when proxying — the
+        # daemon's routes are mounted at `/api/v1/*` and would
+        # 404 on `/v1/*`.
         @api path /api/*
         handle @api {
             reverse_proxy 127.0.0.1:7300 {
@@ -91,8 +96,16 @@
         # directories the build emits here. Anything not in this
         # list and not /repo/* or /api/* falls through to the SPA
         # fallback below.
-        @spaAssets path /_app/* /favicon.ico /assets/*
-        handle @spaAssets {
+        handle_path /_app/* {
+            root * /var/lib/paur/webui
+            file_server
+        }
+        handle_path /favicon.ico {
+            root * /var/lib/paur/webui
+            file_server
+        }
+        handle_path /assets/* {
+            root * /var/lib/paur/webui
             file_server
         }
 
@@ -101,8 +114,8 @@
         # SvelteKit's client-side router can take over. This is
         # what makes `https://paur.example/packages/<name>` work
         # on hard reload.
-        @spaFallback not path /repo/* /api/* /_app/* /favicon.ico /assets/*
-        handle @spaFallback {
+        handle {
+            root * /var/lib/paur/webui
             rewrite * /index.html
             file_server
         }
