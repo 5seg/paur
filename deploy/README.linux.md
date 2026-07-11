@@ -64,12 +64,16 @@ Outputs:
 ## 3. Install the binaries
 
 ```sh
-sudo install -m0755 /opt/paur-src/target/release/paur      /usr/local/bin/paur
-sudo install -m0755 /opt/paur-src/target/release/paur-cli  /usr/local/bin/paur-cli
+sudo install -m0755 /opt/paur-src/target/release/paur      /usr/bin/paur
+sudo install -m0755 /opt/paur-src/target/release/paur-cli  /usr/bin/paur-cli
 ```
 
-`/usr/local/bin` keeps them off the package manager; the systemd
-unit we install later refers to the same paths.
+`/usr/bin` is intentional even on non-Arch hosts: the systemd
+unit in step 9 below hard-codes `ExecStart=/usr/bin/paur`, and
+mismatching the install path was the bug that left an old
+daemon binary running after a `cargo build` (we shadowed the
+binary in `/usr/local/bin/` and the unit kept using the
+`/usr/bin/` copy, with no error to point at it).
 
 ## 4. Create the system user and data dir
 
