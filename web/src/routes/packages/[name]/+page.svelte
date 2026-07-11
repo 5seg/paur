@@ -5,6 +5,7 @@
   import { authState } from '$lib/auth';
   import { goto } from '$app/navigation';
   import { ApiError } from '$lib/api';
+  import StatusBadge from '$lib/components/StatusBadge.svelte';
 
   let name = $derived($page.params.name ?? '');
   let pkg = $state<Package | null>(null);
@@ -112,7 +113,7 @@
 </script>
 
 {#if error}
-  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
     {error}
   </div>
 {/if}
@@ -121,12 +122,12 @@
   <div class="mb-6 flex items-start justify-between gap-4">
     <div>
       <h1 class="text-2xl font-semibold">{pkg.name}</h1>
-      <p class="text-sm text-gray-600">{pkg.aur_url}</p>
-      <p class="text-xs text-gray-500 mt-1">
+      <p class="text-sm text-gray-600 dark:text-slate-400">{pkg.aur_url}</p>
+      <p class="text-xs text-gray-500 mt-1 dark:text-slate-500">
         last ref: {pkg.last_known_ref ?? '-'}
       </p>
       <div class="mt-2 flex items-center gap-2 text-sm">
-        <span class="text-gray-600">auto_rebuild:</span>
+        <span class="text-gray-600 dark:text-slate-400">auto_rebuild:</span>
         {#if $authState.authenticated}
           <button
             type="button"
@@ -135,20 +136,20 @@
             aria-pressed={pkg.auto_rebuild}
             class={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
               pkg.auto_rebuild
-                ? 'border-green-300 bg-green-50 text-green-800 hover:bg-green-100'
-                : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                ? 'border-green-300 bg-green-50 text-green-800 hover:bg-green-100 dark:border-green-500/40 dark:bg-green-500/10 dark:text-green-300 dark:hover:bg-green-500/20'
+                : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700'
             }`}
           >
             <span
               class={`inline-block h-2 w-2 rounded-full ${
-                pkg.auto_rebuild ? 'bg-green-500' : 'bg-gray-400'
+                pkg.auto_rebuild ? 'bg-green-500' : 'bg-gray-400 dark:bg-slate-500'
               }`}
             ></span>
             {pkg.auto_rebuild ? 'yes' : 'no'}
           </button>
-          <span class="text-xs text-gray-400">(click to toggle)</span>
+          <span class="text-xs text-gray-400 dark:text-slate-500">(click to toggle)</span>
         {:else}
-          <span class="text-gray-700">{pkg.auto_rebuild ? 'yes' : 'no'}</span>
+          <span class="text-gray-700 dark:text-slate-300">{pkg.auto_rebuild ? 'yes' : 'no'}</span>
         {/if}
       </div>
     </div>
@@ -156,11 +157,11 @@
   </div>
 
   <h2 class="text-lg font-semibold mb-2">Build flags</h2>
-  <p class="text-xs text-gray-500 mb-3">
+  <p class="text-xs text-gray-500 mb-3 dark:text-slate-400">
     Per-package build tuning. Changes apply to the next build; the running
-    build is unaffected. Send <code>true</code> to enable, leave the rest alone.
+    build is unaffected. Send <code class="dark:bg-slate-800 dark:text-slate-200">true</code> to enable, leave the rest alone.
   </p>
-  <div class="rounded-md border border-gray-200 bg-white p-3 mb-6 text-sm space-y-2">
+  <div class="rounded-md border border-gray-200 bg-white p-3 mb-6 text-sm space-y-2 dark:border-slate-800 dark:bg-slate-900">
     {#snippet flagRow(key: keyof PackageBuildFlags, label: string, hint: string)}
       {@const on = currentFlags()[key]}
       {@const busy = !!pendingFlag[key]}
@@ -173,22 +174,22 @@
             aria-pressed={on}
             class={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
               on
-                ? 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100'
-                : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                ? 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20'
+                : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700'
             }`}
           >
             <span
-              class={`inline-block h-2 w-2 rounded-full ${on ? 'bg-amber-500' : 'bg-gray-400'}`}
+              class={`inline-block h-2 w-2 rounded-full ${on ? 'bg-amber-500' : 'bg-gray-400 dark:bg-slate-500'}`}
             ></span>
             {on ? 'on' : 'off'}
           </button>
         {:else}
-          <span class={`inline-block h-2 w-2 rounded-full mt-1.5 ${on ? 'bg-amber-500' : 'bg-gray-400'}`}></span>
-          <span class="text-xs text-gray-600 w-8">{on ? 'on' : 'off'}</span>
+          <span class={`inline-block h-2 w-2 rounded-full mt-1.5 ${on ? 'bg-amber-500' : 'bg-gray-400 dark:bg-slate-500'}`}></span>
+          <span class="text-xs text-gray-600 dark:text-slate-400 w-8">{on ? 'on' : 'off'}</span>
         {/if}
         <div class="flex-1">
-          <div class="font-medium text-gray-800">{label}</div>
-          <div class="text-xs text-gray-500">{hint}</div>
+          <div class="font-medium text-gray-800 dark:text-slate-200">{label}</div>
+          <div class="text-xs text-gray-500 dark:text-slate-400">{hint}</div>
         </div>
       </div>
     {/snippet}
@@ -211,25 +212,25 @@
 
   <h2 class="text-lg font-semibold mb-2">Latest build</h2>
   {#if pkg.latest_build}
-    <div class="rounded-md border border-gray-200 bg-white p-3 mb-6 text-sm">
+    <div class="rounded-md border border-gray-200 bg-white p-3 mb-6 text-sm dark:border-slate-800 dark:bg-slate-900">
       <div>
-        status: <span class={`badge badge-${pkg.latest_build.status}`}>{pkg.latest_build.status}</span>
-        · <span class="text-gray-600">build #{pkg.latest_build.seq}</span>
+        status: <StatusBadge status={pkg.latest_build.status} />
+        · <span class="text-gray-600 dark:text-slate-400">build #{pkg.latest_build.seq}</span>
         (id {pkg.latest_build.id})
       </div>
       <div>version: {pkg.latest_build.pkg_version ?? '-'}</div>
       <div>exit: {pkg.latest_build.exit_code ?? '-'}</div>
       <div>finished: {fmtTs(pkg.latest_build.finished_at)}</div>
-      <a class="text-blue-700 hover:underline" href={`/builds/${pkg.latest_build.id}`}>
+      <a class="text-blue-700 hover:underline dark:text-blue-400" href={`/builds/${pkg.latest_build.id}`}>
         view build →
       </a>
     </div>
   {:else}
-    <p class="text-gray-500 mb-6">No builds yet.</p>
+    <p class="text-gray-500 mb-6 dark:text-slate-400">No builds yet.</p>
   {/if}
 
   <h2 class="text-lg font-semibold mb-2">Recent builds</h2>
-  <div class="overflow-x-auto rounded-md border border-gray-200 bg-white">
+  <div class="overflow-x-auto rounded-md border border-gray-200 bg-white dark:border-slate-800 dark:bg-slate-900">
     <table class="table-base">
       <thead>
         <tr>
@@ -241,13 +242,13 @@
           <th>Queued</th>
         </tr>
       </thead>
-      <tbody class="divide-y divide-gray-100">
+      <tbody class="divide-y divide-gray-100 dark:divide-slate-800">
         {#each builds as b (b.id)}
           <tr>
             <td>
-              <a class="text-blue-700 hover:underline" href={`/builds/${b.id}`}>#{b.seq}</a>
+              <a class="text-blue-700 hover:underline dark:text-blue-400" href={`/builds/${b.id}`}>#{b.seq}</a>
             </td>
-            <td><span class={`badge badge-${b.status}`}>{b.status}</span></td>
+            <td><StatusBadge status={b.status} /></td>
             <td>{b.trigger}</td>
             <td>{b.pkg_version ?? '-'}</td>
             <td>{b.exit_code ?? '-'}</td>
@@ -256,12 +257,12 @@
         {/each}
         {#if builds.length === 0}
           <tr>
-            <td colspan="6" class="text-gray-500 text-center py-4">No builds yet.</td>
+            <td colspan="6" class="text-gray-500 text-center py-4 dark:text-slate-400">No builds yet.</td>
           </tr>
         {/if}
       </tbody>
     </table>
   </div>
 {:else if !error}
-  <p class="text-gray-500">Loading…</p>
+  <p class="text-gray-500 dark:text-slate-400">Loading…</p>
 {/if}

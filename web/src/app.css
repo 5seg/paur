@@ -10,6 +10,14 @@
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
       'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse-dot,
+    .progress-bar::after,
+    .animate-shimmer {
+      animation: none !important;
+    }
+  }
 }
 
 @layer components {
@@ -18,35 +26,59 @@
            bg-white px-3 py-1.5 text-sm font-medium text-gray-700
            shadow-sm hover:bg-gray-50 focus:outline-none
            focus:ring-2 focus:ring-blue-500 focus:ring-offset-1
-           disabled:opacity-50 disabled:cursor-not-allowed;
+           disabled:opacity-50 disabled:cursor-not-allowed
+           dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200
+           dark:hover:bg-slate-700 dark:focus:ring-offset-slate-900;
   }
   .btn-primary {
-    @apply border-transparent bg-blue-600 text-white hover:bg-blue-700;
+    @apply border-transparent bg-blue-600 text-white hover:bg-blue-700
+           dark:bg-blue-600 dark:hover:bg-blue-500;
   }
   .btn-danger {
-    @apply border-transparent bg-red-600 text-white hover:bg-red-700;
+    @apply border-transparent bg-red-600 text-white hover:bg-red-700
+           dark:bg-red-700 dark:hover:bg-red-600;
   }
   .badge {
-    @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs
-           font-medium;
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs
+           font-medium dark:bg-slate-700 dark:text-slate-200;
   }
-  .badge-queued { @apply bg-gray-200 text-gray-800; }
-  .badge-running { @apply bg-blue-100 text-blue-800; }
-  .badge-success { @apply bg-green-100 text-green-800; }
-  .badge-failed { @apply bg-red-100 text-red-800; }
-  .badge-cancelled { @apply bg-gray-200 text-gray-600; }
+  .badge-queued { @apply bg-gray-200 text-gray-800 dark:bg-slate-700/60 dark:text-slate-300; }
+  .badge-running { @apply bg-blue-100 text-blue-800 dark:bg-blue-500/15 dark:text-blue-300; }
+  .badge-success { @apply bg-green-100 text-green-800 dark:bg-green-500/15 dark:text-green-300; }
+  .badge-failed { @apply bg-red-100 text-red-800 dark:bg-red-500/15 dark:text-red-300; }
+  .badge-cancelled { @apply bg-gray-200 text-gray-600 dark:bg-slate-700/40 dark:text-slate-400; }
   .table-base {
-    @apply min-w-full divide-y divide-gray-200 text-sm;
+    @apply min-w-full divide-y divide-gray-200 text-sm dark:divide-slate-800;
   }
   .table-base th {
     @apply bg-gray-50 px-3 py-2 text-left text-xs font-semibold
-           uppercase tracking-wider text-gray-600;
+           uppercase tracking-wider text-gray-600
+           dark:bg-slate-800/50 dark:text-slate-400;
   }
   .table-base td {
-    @apply whitespace-nowrap px-3 py-2 text-gray-800;
+    @apply whitespace-nowrap px-3 py-2 text-gray-800 dark:text-slate-200;
   }
   .log-view {
     @apply h-[60vh] overflow-y-auto rounded-md border border-gray-300
-           bg-gray-900 p-3 font-mono text-xs text-gray-100;
+           bg-gray-900 p-3 font-mono text-xs text-gray-100
+           dark:border-slate-800 dark:bg-black/40 dark:text-slate-300;
   }
+
+  .progress-bar {
+    @apply relative h-1.5 w-full overflow-hidden rounded-full bg-slate-200
+           dark:bg-slate-800;
+  }
+  .progress-bar::after {
+    @apply absolute inset-y-0 left-0 w-1/4 rounded-full bg-blue-500
+           animate-indeterminate-bar content-[''];
+  }
+
+  .status-dot {
+    @apply inline-block h-1.5 w-1.5 rounded-full;
+  }
+  .status-dot-queued    { @apply bg-paur-queued; }
+  .status-dot-running   { @apply bg-paur-running animate-pulse-dot; }
+  .status-dot-success   { @apply bg-paur-success; }
+  .status-dot-failed    { @apply bg-paur-failed; }
+  .status-dot-cancelled { @apply bg-paur-cancelled; }
 }

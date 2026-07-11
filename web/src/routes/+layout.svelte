@@ -14,7 +14,7 @@
 </script>
 
 <div class="min-h-screen flex flex-col">
-  <header class="border-b border-gray-200 bg-white">
+  <header class="border-b border-slate-800 bg-slate-900">
     <div class="mx-auto max-w-6xl px-4 py-3 flex items-center gap-6">
       <a href="/" class="text-xl font-semibold tracking-tight">paur</a>
       <nav class="flex gap-4 text-sm">
@@ -26,7 +26,7 @@
         ] as item}
           <a
             href={item.href}
-            class="rounded px-2 py-1 hover:bg-gray-100 {$page.url.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/') ? 'bg-gray-100 font-medium' : ''}"
+            class="rounded px-2 py-1 hover:bg-slate-800 {$page.url.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/') ? 'bg-slate-800 font-medium' : ''}"
           >
             {item.label}
           </a>
@@ -35,7 +35,7 @@
       <div class="ml-auto flex items-center gap-3 text-xs">
         {#if $authState.ready}
           {#if $authState.authenticated}
-            <span class="text-gray-500">admin</span>
+            <span class="text-slate-400">admin</span>
             <button class="btn" onclick={doLogout}>Sign out</button>
           {:else}
             <a class="btn btn-primary" href="/login">Sign in</a>
@@ -49,8 +49,8 @@
     {@render children()}
   </main>
 
-  <footer class="border-t border-gray-200 bg-white">
-    <div class="mx-auto max-w-6xl px-4 py-3 text-xs text-gray-500">
+  <footer class="border-t border-slate-800 bg-slate-900">
+    <div class="mx-auto max-w-6xl px-4 py-3 text-xs text-slate-400">
       paur · self-hosted AUR pre-build
     </div>
   </footer>

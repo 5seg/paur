@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
   import { api, fmtTs, streamLogs, type Build } from '$lib/api';
+  import StatusBadge from '$lib/components/StatusBadge.svelte';
 
   let id = $derived(Number($page.params.id));
   let build = $state<Build | null>(null);
@@ -72,44 +73,47 @@
 </script>
 
 <div class="mb-4 flex items-center gap-3">
-  <a class="text-sm text-blue-700 hover:underline" href="/queue">← back</a>
+  <a class="text-sm text-blue-700 hover:underline dark:text-blue-400" href="/queue">← back</a>
   <h1 class="text-2xl font-semibold">
     {#if build}build #{build.seq}{:else}Build #{id}{/if}
   </h1>
   {#if build}
-    <span class={`badge badge-${build.status}`}>{build.status}</span>
-    <span class="text-sm text-gray-500">trigger: {build.trigger}</span>
+    <StatusBadge status={build.status} />
+    <span class="text-sm text-gray-500 dark:text-slate-400">trigger: {build.trigger}</span>
   {/if}
   <div class="ml-auto space-x-2">
     <button class="btn" onclick={refresh}>Refresh</button>
-    <span class="text-xs text-gray-500">
+    <span class="text-xs text-gray-500 dark:text-slate-400">
       {streaming ? 'live' : 'cached'}
     </span>
   </div>
 </div>
 
 {#if error}
-  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+  <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
     {error}
   </div>
 {/if}
 
 {#if build}
+  {#if build.status === 'running'}
+    <div class="progress-bar mb-4"></div>
+  {/if}
   <div class="mb-4 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-    <div><span class="text-gray-500">queued:</span> {fmtTs(build.queued_at)}</div>
-    <div><span class="text-gray-500">started:</span> {fmtTs(build.started_at)}</div>
-    <div><span class="text-gray-500">finished:</span> {fmtTs(build.finished_at)}</div>
-    <div><span class="text-gray-500">exit:</span> {build.exit_code ?? '-'}</div>
-    <div><span class="text-gray-500">version:</span> {build.pkg_version ?? '-'}</div>
-    <div><span class="text-gray-500">file:</span> {build.pkg_file ?? '-'}</div>
-    <div><span class="text-gray-500">worker:</span> {build.worker_id ?? '-'}</div>
-    <div><span class="text-gray-500">trigger:</span> {build.trigger}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">queued:</span> {fmtTs(build.queued_at)}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">started:</span> {fmtTs(build.started_at)}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">finished:</span> {fmtTs(build.finished_at)}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">exit:</span> {build.exit_code ?? '-'}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">version:</span> {build.pkg_version ?? '-'}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">file:</span> {build.pkg_file ?? '-'}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">worker:</span> {build.worker_id ?? '-'}</div>
+    <div><span class="text-gray-500 dark:text-slate-400">trigger:</span> {build.trigger}</div>
   </div>
 {/if}
 
 <div bind:this={logEl} class="log-view">
   {#if logLines.length === 0}
-    <div class="text-gray-500">No log lines yet…</div>
+    <div class="text-gray-500 dark:text-slate-400">No log lines yet…</div>
   {:else}
     {#each logLines as line, i (i)}
       <div>{line}</div>
