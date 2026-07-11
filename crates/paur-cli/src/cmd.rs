@@ -6,6 +6,7 @@
 //! exit codes.
 
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -350,7 +351,7 @@ pub async fn init(
                 "--batch", "--yes", "--pinentry-mode", "loopback",
                 "--passphrase", "",
                 "--local-user", &keyid,
-                "--armor", "--output",
+                "--output",
             ])
             .arg(&sig_path)
             .arg("--detach-sign")
@@ -513,50 +514,122 @@ pub async fn keyring_build(cfg: &Config) -> Result<(), CmdError> {
 
     // Build the two meta-packages sequentially. We don't bother
     // parallelizing — each build is ~10s, and the user runs this
-    // command rarely.
-    let keyring_path = build_meta_package(cfg, "paur-keyring").await?;
-    let mirrorlist_path = build_meta_package(cfg, "paur-mirrorlist").await?;
+    // command rarely. The `keyid` (the FPR of the signing key) is
+    // baked into the `paur-keyring` package as a `<repo>-trusted`
+    // file: `pacman-key --populate <repo>` reads that file and
+    // `lsign-key`s each FPR at full trust, so the next
+    // `pacman -U` of any `paur-*` package validates against a
+    // locally-trusted key.
+    let keyring_path = build_meta_package(cfg, "paur-keyring", &keyid).await?;
+    let mirrorlist_path = build_meta_package(cfg, "paur-mirrorlist", &keyid).await?;
 
     // Publish both. `paur_repo::publish` copies them into the repo
     // arch dir, runs `repo-add`, and signs with the daemon's key.
     let repo = paur_daemon::build_repo_ctx(cfg, &db).await?;
-    let res1 = paur_repo::publish(&repo, &[keyring_path])
+    let res1 = paur_repo::publish(&repo, std::slice::from_ref(&keyring_path))
         .await
         .map_err(|e| CmdError::Other(format!("publish paur-keyring: {e}")))?;
     println!("published paur-keyring; db sig: {}", res1.display());
-    let res2 = paur_repo::publish(&repo, &[mirrorlist_path])
+    let res2 = paur_repo::publish(&repo, std::slice::from_ref(&mirrorlist_path))
         .await
         .map_err(|e| CmdError::Other(format!("publish paur-mirrorlist: {e}")))?;
     println!("published paur-mirrorlist; db sig: {}", res2.display());
+    // Keep the detached signatures for both meta-packages in
+    // place. `pacman -U <URL>.pkg.tar.zst` always fetches
+    // `<URL>.sig` over HTTP, so dropping it (or never creating
+    // it) makes the install fail with a 404 before signature
+    // validation can even run.
+    //
+    // Bootstrap is handled client-side instead (see
+    // `README.md`): the user fetches the server's pubkey
+    // (`<base_url>/repo/x86_64/paur.pubkey.asc`), imports it
+    // with `pacman-key --add`, and lsigns it with
+    // `pacman-key --lsign-key <FPR>`. The first `pacman -U`
+    // of `paur-keyring` then validates against that locally-
+    // trusted key; the post-install hook runs
+    // `pacman-key --populate paur`, which reads the
+    // `<repo_name>-trusted` file shipped inside the package
+    // and lsigns the key (and any subs) at full trust. From
+    // that point on, every `paur-*` install is signature-
+    // validated automatically — no keyservers involved.
+    //
+    // `paur_repo::sign` produces *binary* GPG signatures
+    // (RFC 4880 raw), which is what pacman expects; the
+    // `--armor` flag in the old `paur init` is gone for
+    // the same reason.
+    let base = cfg.public_base_url.trim_end_matches('/');
     println!("\nClients can now install with:");
-    println!("  sudo pacman -U {}/{}-keyring-*.pkg.tar.zst",
-             cfg.public_base_url.trim_end_matches('/'),
-             cfg.repo_name);
-    println!("  sudo pacman -U {}/{}-mirrorlist-*.pkg.tar.zst",
-             cfg.public_base_url.trim_end_matches('/'),
-             cfg.repo_name);
-    let _ = keyid; // suppress unused; gpg_key comes via repo ctx
+    println!("  sudo pacman -U --noconfirm {}/repo/{}/{}-keyring-*.pkg.tar.zst",
+             base, cfg.arch, cfg.repo_name);
+    println!("  sudo pacman -U --noconfirm {}/repo/{}/{}-mirrorlist-*.pkg.tar.zst",
+             base, cfg.arch, cfg.repo_name);
     Ok(())
 }
 
 /// Build one meta-package via the local-build container path.
 /// Returns the on-disk `.pkg.tar.*` produced.
+///
+/// `keyid` is the FPR of the signing key. It's only used by the
+/// `paur-keyring` PKGBUILD to populate a `<repo>-trusted` file
+/// inside the package; the mirrorlist doesn't need it.
 async fn build_meta_package(
     cfg: &Config,
     label: &'static str,
+    keyid: &str,
 ) -> Result<std::path::PathBuf, CmdError> {
     let tmp = tempfile::tempdir()
         .map_err(|e| CmdError::Other(format!("tempdir: {e}")))?;
-    write_pkgbuild(tmp.path(), label, cfg)?;
+    // `tempfile::tempdir` creates the directory with mode 0700 owned
+    // by the calling uid. The build container runs as a different
+    // uid (`builder` inside `paur-builder`) and bind-mounts this
+    // dir read-only at /work/src; makepkg needs to be able to
+    // *read* the PKGBUILD and any staged files. Loosen to 0755 so
+    // any other user can read.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| CmdError::Other(format!("chmod 0755 tempdir: {e}")))?;
+    write_pkgbuild(tmp.path(), label, cfg, keyid)?;
 
     let work_dir = cfg.work_dir.join(format!("keyring-{label}"));
     let _ = std::fs::remove_dir_all(&work_dir);
     std::fs::create_dir_all(&work_dir)?;
+    // Same story for the work dir: 0o777 so the container's `builder`
+    // uid (which won't match our uid) can write the .pkg.tar.zst
+    // and pkg/ tree into it via the bind mount.
+    std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o777))
+        .map_err(|e| CmdError::Other(format!("chmod 0777 work_dir: {e}")))?;
+    // The container overlays a tmpfs at /work/build over the host's
+    // work_dir. If a `build/` subdir already exists on the host,
+    // docker can't layer the tmpfs on top ("Device or resource busy"
+    // when the build script tries to rm it). Make sure there isn't
+    // one. The container's `rm -rf /work/build` would otherwise fail
+    // and the whole local build aborts.
+    let _ = std::fs::remove_dir_all(work_dir.join("build"));
+    std::fs::create_dir_all(work_dir.join("out"))?;
+    std::fs::set_permissions(
+        work_dir.join("out"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .map_err(|e| CmdError::Other(format!("chmod 0777 out: {e}")))?;
+
+    // Fresh scratch dir for the container's /work/build. makepkg
+    // dumps pkg/, src/, and the .pkg.tar.* here, then build.sh
+    // moves the artifact to /work/out. A fresh dir per invocation
+    // avoids stale files from a previous run poisoning this one
+    // (e.g. mismatched `pkg/` content) and keeps the host's
+    // work_dir clean of in-progress build debris.
+    let tmp_build = tempfile::tempdir()
+        .map_err(|e| CmdError::Other(format!("tmp build dir: {e}")))?;
+    std::fs::set_permissions(
+        tmp_build.path(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .map_err(|e| CmdError::Other(format!("chmod 0777 tmp_build: {e}")))?;
 
     let req = paur_builder::LocalBuildRequest {
         label: label.to_string(),
         pkgbuild_dir: tmp.path().to_path_buf(),
         work_dir,
+        tmp_build_dir: tmp_build.path().to_path_buf(),
         ccache_dir: cfg.ccache_dir.clone(),
         runtime: cfg.container_runtime,
         image: cfg.builder_image.clone(),
@@ -585,10 +658,17 @@ async fn build_meta_package(
 /// can `cat` it into the package's `/usr/share/pacman/keyrings/`
 /// path. This avoids having to bind-mount the host's repo dir into
 /// the container — the package is fully self-contained.
+///
+/// `keyid` is the FPR of the signing key. For the keyring label
+/// it's also baked into a `<repo>-trusted` sidecar file. `pacman-key
+/// --populate <repo>` reads that file and `lsign-key`s each FPR at
+/// full trust (level 4), so subsequent `pacman -U`/`pacman -Sy` of
+/// any `paur-*` package validate without further user action.
 fn write_pkgbuild(
     dir: &Path,
     label: &'static str,
     cfg: &Config,
+    keyid: &str,
 ) -> Result<(), CmdError> {
     let repo_name = cfg.repo_name.clone();
     let base_url = cfg.public_base_url.trim_end_matches('/').to_string();
@@ -605,6 +685,50 @@ fn write_pkgbuild(
                     pubkey_src.display()
                 ))
             })?;
+            // Stage the `<repo>-trusted` file. Format: one
+            // `<FPR>:<trust-level>:` line per key. `pacman-key
+            // --populate <repo>` reads this and runs
+            // `gpg --lsign-key <FPR>` for each entry, so the
+            // signing key is marked as locally-trusted at the
+            // level the server picks. We use 4 (full trust)
+            // because the server's keyring pkg is itself how
+            // the key was bootstrapped into the local keyring
+            // — i.e. we already trust the build pipeline. Chaotic
+            // ships the same file with the same level.
+            let trusted_name = format!("{repo_name}-trusted");
+            let trusted_path = dir.join(&trusted_name);
+            // `<keyid>` is a single FPR (the primary signing key
+            // we created in `init`); writing one line is enough
+            // for `--lsign-key`. If we ever add subkeys used for
+            // signing, list each FPR on its own line.
+            std::fs::write(&trusted_path, format!("{keyid}:4:\n")).map_err(|e| {
+                CmdError::Other(format!("write {trusted_name}: {e}"))
+            })?;
+            // Stage the install script next to the PKGBUILD too.
+            // makepkg reads the path in `install=` and copies the
+            // file into the package automatically (it does NOT
+            // need to be in `source=`); pacman then runs
+            // post_install() after the files are on disk. The
+            // post_install runs `pacman-key --populate <repo>`,
+            // which imports `<repo>.gpg` and lsigns the keys
+            // listed in `<repo>-trusted` (which we just baked in
+            // above). Chaotic-aur does the same.
+            std::fs::write(
+                dir.join(format!("{repo_name}-keyring.install")),
+                format!(
+                    r#"post_install() {{
+    if [ -x usr/bin/pacman-key ]; then
+        usr/bin/pacman-key --populate {repo_name} || true
+    fi
+}}
+
+post_upgrade() {{
+    post_install
+}}
+"#
+                ),
+            )
+            .map_err(|e| CmdError::Other(format!("write install script: {e}")))?;
 
             format!(
                 r#"# Auto-generated by `paur-cli keyring-build`. Do not edit by hand.
@@ -614,12 +738,53 @@ pkgrel=1
 pkgdesc="GPG keyring for the {repo_name} pacman repo"
 arch=('any')
 license=('GPL')
+# `install=` is read by makepkg: it copies the file next to PKGBUILD
+# into the resulting package and records the path in .PKGINFO so
+# pacman runs post_install() at install time. The file itself is
+# staged by `write_pkgbuild` and is not in `source=`.
+install={repo_name}-keyring.install
+# Staged next to PKGBUILD on the host; bind-mounted at /work/src.
+# makepkg copies sources from $SRCDEST (default: next to PKGBUILD)
+# into $srcdir before running package(). Declaring each file here
+# is what makes it appear under $srcdir inside the container.
+source=("paur.pubkey.asc"
+        "{repo_name}-trusted"
+        "{repo_name}-keyring.install")
+# SKIP all three: the pubkey is a binary GPG blob whose bytes are
+# not stable across re-exports, the trusted file is regenerated by
+# us on every `paur-cli keyring-build` and may change when the key
+# rotates, and the install script is also regenerated on every
+# build. The FPR baked into `<repo>-trusted` and the install
+# script's content are the source of truth, not the byte content.
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP')
 
 package() {{
     install -dm755 "$pkgdir/usr/share/pacman/keyrings/"
+    # Four files:
+    #   `<repo_name>`     — ASCII-armored keyring, used by
+    #                       `pacman-key --add` (manual bootstrap
+    #                       before `pacman -U <keyring.pkg>`).
+    #   `<repo_name>.gpg` — binary form, used by `pacman-key
+    #                       --populate` (the post_install hook
+    #                       runs this on package install). pacman
+    #                       5.x requires the `.gpg` form here.
+    #   `<repo_name>-revoked` — empty file required by pacman-key
+    #                       when the keyring has revoked sigs.
+    #                       Chaotic-aur ships the same.
+    #   `<repo_name>-trusted` — `<FPR>:<level>:` per key, read by
+    #                       `pacman-key --populate` to lsign each
+    #                       FPR at the listed trust level.
     install -m0644 \
         "$srcdir/paur.pubkey.asc" \
-        "$pkgdir/usr/share/pacman/keyrings/{repo_name}.asc"
+        "$pkgdir/usr/share/pacman/keyrings/{repo_name}"
+    gpg --dearmor < "$srcdir/paur.pubkey.asc" \
+        > "$pkgdir/usr/share/pacman/keyrings/{repo_name}.gpg"
+    : > "$pkgdir/usr/share/pacman/keyrings/{repo_name}-revoked"
+    install -m0644 \
+        "$srcdir/{repo_name}-trusted" \
+        "$pkgdir/usr/share/pacman/keyrings/{repo_name}-trusted"
 }}
 "#
             )
@@ -632,25 +797,35 @@ pkgrel=1
 pkgdesc="Mirror list for the {repo_name} pacman repo"
 arch=('any')
 license=('GPL')
+backup=('etc/pacman.d/{repo_name}-mirrorlist')
 
 package() {{
     install -dm755 "$pkgdir/etc/pacman.d/"
-    cat > "$pkgdir/etc/pacman.d/{repo_name}-mirrorlist" <<'EOF'
+    # The file is a *mirror list*: one `Server =` URL per line,
+    # matching the format pacman uses for `core`/`extra`/
+    # `multilib` (see `/etc/pacman.d/mirrorlist` on any Arch
+    # install). It's `Include`-d from `/etc/pacman.conf` inside
+    # a `[{repo_name}]` section as
+    #   Include = /etc/pacman.d/{repo_name}-mirrorlist
+    # so pacman treats each line as a candidate Server URL.
+    # `$arch` is expanded by pacman itself at sync time, the
+    # same way it expands `$arch` in the system mirrorlist.
+    # We only ship one Server line — a personal repo has a
+    # single endpoint — but the file format leaves room for
+    # more if a future deployer wants mirrors.
+    cat > "$pkgdir/etc/pacman.d/{repo_name}-mirrorlist" <<EOF
 ## {repo_name} pacman repository
 ##
 ## To enable, add to /etc/pacman.conf:
 ##   [{repo_name}]
+##   SigLevel = Required DatabaseOptional
 ##   Include = /etc/pacman.d/{repo_name}-mirrorlist
 ##
 ## This file is generated by paur and tracks your
 ## configured public_base_url. Edit paur.toml and
 ## re-run `paur-cli keyring-build` to update.
 
-[options]
-SigLevel = Optional TrustedOnly
-
-[{repo_name}]
-Server = {base_url}/$arch
+Server = {base_url}/repo/\$arch
 EOF
 }}
 "#
@@ -815,7 +990,10 @@ mod tests {
     /// `write_pkgbuild` lays out a self-contained PKGBUILD dir for
     /// each meta-package. The keyring variant must copy the host's
     /// `paur.pubkey.asc` next to the PKGBUILD so the container build
-    /// can `cat` it into the package without bind-mounts.
+    /// can `cat` it into the package without bind-mounts. It must
+    /// also write a `<repo>-trusted` file with the signing key's
+    /// FPR at level 4, so `pacman-key --populate <repo>` can lsign
+    /// the key on install.
     #[test]
     fn write_pkgbuild_lays_out_keyring() {
         let dir = tempdir().expect("tempdir");
@@ -827,23 +1005,39 @@ mod tests {
             .expect("write pubkey");
 
         let pkgbuild_dir = tempdir().expect("pkgbuild tempdir");
-        write_pkgbuild(pkgbuild_dir.path(), "paur-keyring", &cfg)
+        let fake_fpr = "0123456789ABCDEF0123456789ABCDEF01234567";
+        write_pkgbuild(pkgbuild_dir.path(), "paur-keyring", &cfg, fake_fpr)
             .expect("write keyring pkgbuild");
 
-        // The PKGBUILD should exist.
+        // The PKGBUILD should exist and reference the keyring path.
         let pkgbuild = pkgbuild_dir.path().join("PKGBUILD");
         let body = std::fs::read_to_string(&pkgbuild).expect("read PKGBUILD");
         assert!(body.contains("pkgname=paur-keyring"));
-        assert!(body.contains("usr/share/pacman/keyrings/paur.asc"));
+        assert!(body.contains("usr/share/pacman/keyrings/paur"));
+        assert!(body.contains("paur.pubkey.asc"));
 
         // The pubkey should be staged next to it.
         let staged = pkgbuild_dir.path().join("paur.pubkey.asc");
         let staged_bytes = std::fs::read(&staged).expect("read staged pubkey");
         assert_eq!(staged_bytes, b"FAKE PGP KEY");
+
+        // The `<repo>-trusted` sidecar must list the FPR at level 4
+        // (full trust), so `pacman-key --populate paur` lsigns it.
+        let trusted = pkgbuild_dir.path().join("paur-trusted");
+        let trusted_body = std::fs::read_to_string(&trusted)
+            .expect("read trusted file");
+        assert_eq!(trusted_body, format!("{fake_fpr}:4:\n"));
+
+        // And the install script (consumed by `install=`).
+        let install = pkgbuild_dir.path().join("paur-keyring.install");
+        let install_body = std::fs::read_to_string(&install)
+            .expect("read install script");
+        assert!(install_body.contains("pacman-key --populate paur"));
     }
 
     /// Mirrorlist PKGBUILD embeds the configured `public_base_url`
-    /// and the repo name into the package's mirrorlist file.
+    /// and the repo name into the package's mirrorlist file. The
+    /// keyid is unused for the mirrorlist label; pass a dummy.
     #[test]
     fn write_pkgbuild_lays_out_mirrorlist() {
         let dir = tempdir().expect("tempdir");
@@ -851,14 +1045,61 @@ mod tests {
         cfg.public_base_url = "https://paur.example".into();
 
         let pkgbuild_dir = tempdir().expect("pkgbuild tempdir");
-        write_pkgbuild(pkgbuild_dir.path(), "paur-mirrorlist", &cfg)
-            .expect("write mirrorlist pkgbuild");
+        write_pkgbuild(
+            pkgbuild_dir.path(),
+            "paur-mirrorlist",
+            &cfg,
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+        )
+        .expect("write mirrorlist pkgbuild");
 
         let body =
             std::fs::read_to_string(pkgbuild_dir.path().join("PKGBUILD"))
                 .expect("read PKGBUILD");
         assert!(body.contains("pkgname=paur-mirrorlist"));
-        assert!(body.contains("https://paur.example/$arch"));
         assert!(body.contains("/etc/pacman.d/paur-mirrorlist"));
+        // Mirrorlist pkg installs a *mirror list* file (one
+        // `Server =` URL per line) referenced from pacman.conf
+        // via `Include = ...`. We must NOT ship a `[paur]`
+        // section header in the mirrorlist *file* (the PKGBUILD
+        // can mention it in comments), or pacman would
+        // double-register the database.
+        //
+        // Note: the PKGBUILD itself contains `\$arch` (an
+        // escaped `$` inside the unquoted heredoc) so bash
+        // writes a literal `$arch` to the mirrorlist file at
+        // install time, which pacman then expands.
+        assert!(body.contains("Server = https://paur.example/repo/\\$arch"));
+        // The mirrorlist *file* (the heredoc body, not the
+        // surrounding PKGBUILD comments) must not contain a
+        // section header. The heredoc is bounded by `<<EOF` /
+        // `EOF`; pull it out and assert on it alone.
+        let heredoc_body = body
+            .split("<<EOF")
+            .nth(1)
+            .expect("heredoc marker present")
+            .split("\nEOF")
+            .next()
+            .expect("heredoc terminator present");
+        // The mirrorlist file must contain exactly one
+        // `Server = ...` line and no section header on its
+        // own line. (It can mention `[paur]` in `##`
+        // comments — pacman ignores those — but it must not
+        // *contain* a section header that would conflict
+        // with the section in pacman.conf and trigger
+        // "database already registered".)
+        let server_lines: Vec<_> = heredoc_body
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Server ="))
+            .collect();
+        assert_eq!(
+            server_lines.len(),
+            1,
+            "mirrorlist must have exactly one Server = line"
+        );
+        assert!(
+            server_lines[0].contains("https://paur.example/repo/\\$arch"),
+            "Server URL should embed the configured base URL"
+        );
     }
 }

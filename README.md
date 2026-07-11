@@ -82,32 +82,64 @@ Caddy in front, exposing the repo to other machines), see
 ### 2. Client (the box that does `pacman -Sy <pkg>`)
 
 Replace `paur.example` with the hostname your paur server is
-reachable at, and the file names with whatever `paur-cli
-keyring-build` printed on the server.
+reachable at. The server has already run `paur-cli keyring-build`
+once (see `deploy/README.md`) to publish the two meta-packages and
+the server's GPG public key into `repo/x86_64/`.
+
+paur's GPG key is generated locally on the server and **not**
+published to any public keyserver, so the first `pacman -U` cannot
+validate the keyring package's signature out of the box. We work
+around this by adding the pubkey to the local keyring from the
+server's URL first (chaotic-aur's bootstrap works the same way,
+just with a keyserver instead of an HTTP URL).
+
+The FPR is printed on the server when you run `paur-cli init`
+(look for the line `generated new key: <FPR>`) and again at the
+end of `paur-cli keyring-build`. If you don't have it, fetch the
+pubkey once and read the FPR from it directly.
 
 ```sh
-# 1. Trust the keyring and install the mirrorlist.
-#    These two packages are built once on the server and don't
-#    change often; re-run only when the server is re-keyed or
-#    its URL moves.
-sudo pacman -U 'https://paur.example/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
-sudo pacman -U 'https://paur.example/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
+# 0. (once per client) Find the server's GPG fingerprint.
+#    `paur-cli keyring-build` printed it on the server; if you
+#    don't have it, read it from the served pubkey:
+FPR=$(curl -sSL http://paur.example/repo/x86_64/paur.pubkey.asc \
+        | gpg --import-options show-only --import 2>/dev/null \
+        | awk '/^pub/{print $2}' | head -1 | cut -d/ -f2)
+echo "$FPR"   # 40 hex chars
 
-# 2. Add the repo to pacman.conf.
+# 1. Add the pubkey to the local keyring and mark it trusted.
+#    This is the one-time bootstrap: we can't use `pacman -U` yet
+#    because that would need the key to already be trusted in
+#    order to validate the keyring package's own signature.
+sudo pacman-key --add <(curl -sSL http://paur.example/repo/x86_64/paur.pubkey.asc)
+sudo pacman-key --lsign-key "$FPR"
+
+# 2. Install the keyring + mirrorlist meta-packages. The
+#    `paur-keyring` post-install hook runs
+#    `pacman-key --populate paur` which imports
+#    `/usr/share/pacman/keyrings/paur.gpg` and lsigns every FPR
+#    in `/usr/share/pacman/keyrings/paur-trusted` at full trust
+#    (so even if step 1 used a different trust level, the
+#    keyring pkg upgrades it to full). From this point on every
+#    subsequent `pacman -U` / `pacman -Sy` of `paur-*` packages
+#    is signature-validated automatically.
+sudo pacman -U --noconfirm 'http://paur.example/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
+sudo pacman -U --noconfirm 'http://paur.example/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
+
+# 3. Add the repo to pacman.conf
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
 Include = /etc/pacman.d/paur-mirrorlist
 EOF
 
-# 3. Sync and install
+# 4. Sync and install
 sudo pacman -Sy hello-pkg
 ```
 
-No `pacman-key --recv-keys`. No `--lsign-key`. No manual
-fingerprint copy-paste. The keyring package places the pubkey
-at the standard `/usr/share/pacman/keyrings/paur.asc` path;
-pacman trusts it automatically when the `[paur]` section is
-enabled.
+If you ever want to publish the key to a keyserver, run
+`gpg --send-keys <FPR>` on the server and from then on you can
+also `pacman-key --recv-keys <FPR>` on a fresh client instead
+of going through `curl` + `pacman-key --add`.
 
 ## Testing
 

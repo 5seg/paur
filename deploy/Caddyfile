@@ -30,6 +30,14 @@
 # the global `{ ... }` along with the hostnames you want to
 # serve; Caddy will then ignore the `auto_https off` and run ACME
 # on first request.
+#
+# Note on the (now removed) host matcher: Caddy's `host` directive
+# requires a fully-qualified hostname (or trailing dot). Browsers
+# hitting `http://xserver` (Tailscale MagicDNS bare name) sent
+# `Host: xserver` without a TLD, which Caddy treated as an
+# implicit-HTTPS site and skipped — every `/_app/*`, `/api/*`,
+# `/repo/*` request returned 404. We now serve every `:80` host
+# from a single site.
 
 {
     auto_https off
@@ -38,86 +46,80 @@
     }
 }
 
-# Bind :80 directly and match any Host header inside an explicit
-# `@host` matcher. Caddy treats bare hostnames (`xserver`) as
-# implicit HTTPS sites and binds only :443, leaving :80 closed;
-# `http://xserver` works for the named host but routes other
-# methods to the empty default site (we saw GET 200 / PATCH 404
-# because the SPA fallback ate GETs but not PATCHes). `:80` with
-# a Host matcher is the only form that handles every method on
-# every host we serve.
+# No host matcher: Caddy's `host` matcher requires a fully-qualified
+# hostname (or trailing dot), so `Host: xserver` from a browser on a
+# Tailscale MagicDNS name would 404 every route. We've already
+# committed to "serve everything on :80" with `auto_https off`, so
+# just let the inner handles run for every host.
 :80 {
-    # Per-path routing. We use `handle_path` for the file-serving
-    # scopes because it strips the matched prefix from the request
-    # path before delegating, which makes it impossible to leak a
-    # parent-scope `root` into a child handle. `handle` + a child
-    # `root` *should* work, but in practice Caddy 2.6+'s
-    # `vars` semantics make it brittle when the parent also
-    # sets `root`; using `handle_path` with the root set in the
-    # same block is the bulletproof form.
-    @hostnames host paur.example localhost xserver
-    route @hostnames {
-        encode zstd gzip
+    encode zstd gzip
 
-        # Static repo files first — these are the actual packages
-        # and DB that `pacman -Sy` fetches. We set short caching
-        # so a new build is visible after the next `pacman -Sy`.
-        # `handle_path /repo` strips the /repo prefix from the
-        # request, so the inner file_server looks for
-        # `<root>/x86_64/<file>` directly.
-        handle_path /repo/* {
-            root * /var/lib/paur/repo
-            file_server
-            header Cache-Control "no-cache, must-revalidate"
-        }
+    # Static repo files first — these are the actual packages
+    # and DB that `pacman -Sy` fetches. We set short caching
+    # so a new build is visible after the next `pacman -Sy`.
+    # `handle_path /repo` strips the /repo prefix from the
+    # request, so the inner file_server looks for
+    # `<root>/x86_64/<file>` directly.
+    handle_path /repo/* {
+        root * /var/lib/paur/repo
+        file_server
+        header Cache-Control "no-cache, must-revalidate"
+    }
 
-        # Daemon HTTP API (the SvelteKit UI talks to this through
-        # the Vite dev proxy, and at runtime through this reverse
-        # proxy). We use `handle` (not `handle_path`) here so the
-        # full `/api/*` path is preserved when proxying — the
-        # daemon's routes are mounted at `/api/v1/*` and would
-        # 404 on `/v1/*`.
-        @api path /api/*
-        handle @api {
-            reverse_proxy 127.0.0.1:7300 {
-                header_up Host {host}
-                header_up X-Real-IP {remote_host}
-                transport http {
-                    dial_timeout 5s
-                    # SSE log streams live up to an hour; don't
-                    # time out.
-                    response_header_timeout 1h
-                }
+    # Daemon HTTP API (the SvelteKit UI talks to this through
+    # the Vite dev proxy, and at runtime through this reverse
+    # proxy). We use `handle` (not `handle_path`) here so the
+    # full `/api/*` path is preserved when proxying — the
+    # daemon's routes are mounted at `/api/v1/*` and would
+    # 404 on `/v1/*`.
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:7300 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            transport http {
+                dial_timeout 5s
+                # SSE log streams live up to an hour; don't
+                # time out.
+                response_header_timeout 1h
             }
         }
+    }
 
-        # SvelteKit static assets — hashed bundle files under
-        # /_app, favicon, etc. List any top-level asset
-        # directories the build emits here. Anything not in this
-        # list and not /repo/* or /api/* falls through to the SPA
-        # fallback below.
-        handle_path /_app/* {
-            root * /var/lib/paur/webui
-            file_server
-        }
-        handle_path /favicon.ico {
-            root * /var/lib/paur/webui
-            file_server
-        }
-        handle_path /assets/* {
-            root * /var/lib/paur/webui
-            file_server
-        }
+    # SvelteKit static assets — hashed bundle files under
+    # /_app, favicon, etc. List any top-level asset
+    # directories the build emits here. Anything not in this
+    # list and not /repo/* or /api/* falls through to the SPA
+    # fallback below.
+    #
+    # We point root at `<webui>/_app` (not `<webui>`) because
+    # `handle_path /_app/*` strips the matched prefix before
+    # applying root. With root = `<webui>`, a request for
+    # `/_app/version.json` would look for `<webui>/version.json`,
+    # which doesn't exist. The SvelteKit static layout puts
+    # version.json + the immutable/* bundle tree under `_app/`
+    # alongside index.html at the top level.
+    handle_path /_app/* {
+        root * /var/lib/paur/webui/_app
+        file_server
+    }
+    handle_path /favicon.ico {
+        root * /var/lib/paur/webui
+        file_server
+    }
+    handle_path /assets/* {
+        root * /var/lib/paur/webui
+        file_server
+    }
 
-        # SPA fallback: anything that isn't a real asset, repo
-        # file, or API call gets rewritten to /index.html so
-        # SvelteKit's client-side router can take over. This is
-        # what makes `https://paur.example/packages/<name>` work
-        # on hard reload.
-        handle {
-            root * /var/lib/paur/webui
-            rewrite * /index.html
-            file_server
-        }
+    # SPA fallback: anything that isn't a real asset, repo
+    # file, or API call gets rewritten to /index.html so
+    # SvelteKit's client-side router can take over. This is
+    # what makes `https://paur.example/packages/<name>` work
+    # on hard reload.
+    handle {
+        root * /var/lib/paur/webui
+        rewrite * /index.html
+        file_server
     }
 }

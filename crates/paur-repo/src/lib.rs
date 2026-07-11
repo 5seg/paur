@@ -397,10 +397,15 @@ pub async fn list_signing_key(gpg_home: &Path, email: &str) -> paur_core::Result
     )))
 }
 
-/// Produce a detached armored GPG signature for `target` inside
+/// Produce a detached GPG signature for `target` inside
 /// `gpg_home`. The signature is written next to `target` with the
 /// `.sig` extension (pacman convention). Removes any existing `.sig`
 /// first.
+///
+/// Note: pacman expects the *binary* GPG signature format
+/// (RFC 4880 raw signature packet), not the ASCII-armored
+/// `-----BEGIN PGP SIGNATURE-----` block. We do *not* pass
+/// `--armor` here, even though it makes the file human-readable.
 async fn sign(
     gpg_home: &Path,
     keyid: &str,
@@ -422,7 +427,6 @@ async fn sign(
             "",
             "--local-user",
             keyid,
-            "--armor",
             "--output",
         ])
         .arg(&sig_path)

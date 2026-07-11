@@ -234,27 +234,44 @@ UI.
 
 ## 13. Set up a client
 
-On each Arch machine that should use the repo:
+On each Arch machine that should use the repo. The FPR below is
+the one `paur-cli keyring-build` printed on the server (it's the
+primary fingerprint of the locally-generated paur signing key,
+**not** a keyserver-published one — that would defeat the
+personal-use threat model).
 
 ```sh
-# 1. Install the keyring and mirrorlist meta-packages.
+# 0. Find the FPR if you don't have it.
+FPR=$(curl -sSL https://paur.5seg.top/repo/x86_64/paur.pubkey.asc \
+        | gpg --import-options show-only --import 2>/dev/null \
+        | awk '/^pub/{print $2}' | head -1 | cut -d/ -f2)
+echo "$FPR"   # 40 hex chars
+
+# 1. Bootstrap: add the pubkey to the local keyring and trust it.
+sudo pacman-key --add <(curl -sSL https://paur.5seg.top/repo/x86_64/paur.pubkey.asc)
+sudo pacman-key --lsign-key "$FPR"
+
+# 2. Install the keyring and mirrorlist meta-packages.
 sudo pacman -U 'https://paur.5seg.top/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
 sudo pacman -U 'https://paur.5seg.top/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
 
-# 2. Enable the repo.
+# 3. Enable the repo.
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
 Include = /etc/pacman.d/paur-mirrorlist
 EOF
 
-# 3. Sync and install.
+# 4. Sync and install.
 sudo pacman -Sy hello-pkg
 ```
 
-No `pacman-key --recv-keys`, no `--lsign-key`, no manual
-fingerprint copy-paste. The keyring package places the pubkey at
-`/usr/share/pacman/keyrings/paur.asc`; pacman trusts it
-automatically once the `[paur]` section is enabled.
+The `paur-keyring` package's post-install hook runs
+`pacman-key --populate paur`, which imports the pubkey from
+`/usr/share/pacman/keyrings/paur.gpg` and lsigns the FPR
+listed in `/usr/share/pacman/keyrings/paur-trusted` at full
+trust — so step 1's `--lsign-key` is technically redundant
+once step 2 completes, but it's needed *before* step 2 in
+order to validate the keyring package's own signature.
 
 ## Troubleshooting
 

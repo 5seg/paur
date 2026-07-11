@@ -36,75 +36,83 @@
     }
 }
 
-# Replace `paur.5seg.top` with your hostname. The other two are
-# conveniences for testing directly on the build host. Bare
-# hostnames (no `http://` prefix) match the Host header on
-# whatever port the listener is bound to. The same rule applies
-# here as in `deploy/Caddyfile` — using `http://localhost` and
-# `http://xserver` instead causes PATCH/POST on those hosts to
-# fall into Caddy's default (empty) site and 404.
-# Bind :80 directly and match any Host header inside an explicit
-# `@host` matcher. See `deploy/Caddyfile` for why this is the
-# only form that handles every method on every host we serve.
+# Note on the (now removed) host matcher: Caddy's `host` directive
+# requires a fully-qualified hostname (or trailing dot). Browsers
+# hitting `http://xserver` (Tailscale MagicDNS bare name) sent
+# `Host: xserver` without a TLD, which Caddy treated as an
+# implicit-HTTPS site and skipped — every `/_app/*`, `/api/*`,
+# `/repo/*` request returned 404. We now serve every `:80` host
+# from a single site. If you need to lock this down to a
+# specific public hostname, add a `host` matcher back in
+# *and* include the FQDN, not just the bare label.
 :80 {
-    @hostnames host paur.5seg.top localhost xserver
-    handle @hostnames {
-        # Where the SvelteKit `npm run build` output lives. This
-        # directory is owned by the deployer (root or your user)
-        # and only ever written by the deploy step. The daemon
-        # never touches it; see the header in `deploy/Caddyfile`
-        # for why we keep it separate from `repo/`. Must be
-        # readable by the caddy user (typically 0755 directories,
-        # 0644 files).
-        root * /var/lib/paur/webui
+    # Where the SvelteKit `npm run build` output lives. This
+    # directory is owned by the deployer (root or your user)
+    # and only ever written by the deploy step. The daemon
+    # never touches it; see the header in `deploy/Caddyfile`
+    # for why we keep it separate from `repo/`. Must be
+    # readable by the caddy user (typically 0755 directories,
+    # 0644 files).
+    root * /var/lib/paur/webui
 
-        encode zstd gzip
+    encode zstd gzip
 
-        # Static repo files first — these are the actual packages
-        # and DB that `pacman -Sy` fetches. We set short caching
-        # so a new build is visible after the next `pacman -Sy`.
-        @repo path /repo/*
-        handle @repo {
-            root * /var/lib/paur/repo
-            file_server
-            header Cache-Control "no-cache, must-revalidate"
-        }
+    # Static repo files first — these are the actual packages
+    # and DB that `pacman -Sy` fetches. We set short caching
+    # so a new build is visible after the next `pacman -Sy`.
+    handle_path /repo/* {
+        root * /var/lib/paur/repo
+        file_server
+        header Cache-Control "no-cache, must-revalidate"
+    }
 
-        # Daemon HTTP API. The SvelteKit UI talks to this through
-        # the Vite dev proxy in dev, and through this reverse
-        # proxy in production.
-        @api path /api/*
-        handle @api {
-            reverse_proxy 127.0.0.1:7300 {
-                transport http {
-                    dial_timeout 5s
-                    # SSE log streams live up to an hour; don't
-                    # time out.
-                    response_header_timeout 1h
-                }
+    # Daemon HTTP API. The SvelteKit UI talks to this through
+    # the Vite dev proxy in dev, and through this reverse
+    # proxy in production.
+    @api path /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:7300 {
+            transport http {
+                dial_timeout 5s
+                # SSE log streams live up to an hour; don't
+                # time out.
+                response_header_timeout 1h
             }
         }
+    }
 
-        # SvelteKit static assets — hashed bundle files under
-        # /_app, favicon, etc. List any top-level asset
-        # directories the build emits here. Anything not in this
-        # list and not /repo/* or /api/* falls through to the SPA
-        # fallback below.
-        @spaAssets path /_app/* /favicon.ico /assets/*
-        handle @spaAssets {
-            file_server
-        }
+    # SvelteKit static assets — hashed bundle files under
+    # /_app, favicon, etc. List any top-level asset
+    # directories the build emits here. Anything not in this
+    # list and not /repo/* or /api/* falls through to the SPA
+    # fallback below.
+    #
+    # We point root at `<webui>/_app` (not `<webui>`) because
+    # `handle_path /_app/*` strips the matched prefix before
+    # applying root. With root = `<webui>`, a request for
+    # `/_app/version.json` would look for `<webui>/version.json`,
+    # which doesn't exist. The SvelteKit static layout puts
+    # version.json + the immutable/* bundle tree under `_app/`
+    # alongside index.html at the top level.
+    handle_path /_app/* {
+        root * /var/lib/paur/webui/_app
+        file_server
+    }
+    handle_path /favicon.ico {
+        file_server
+    }
+    handle_path /assets/* {
+        file_server
+    }
 
-        # SPA fallback: anything that isn't a real asset, repo
-        # file, or API call gets rewritten to /index.html so
-        # SvelteKit's client-side router can take over. This is
-        # what makes `https://paur.5seg.top/packages/<name>` work
-        # on hard reload.
-        @spaFallback not path /repo/* /api/* /_app/* /favicon.ico /assets/*
-        handle @spaFallback {
-            rewrite * /index.html
-            file_server
-        }
+    # SPA fallback: anything that isn't a real asset, repo
+    # file, or API call gets rewritten to /index.html so
+    # SvelteKit's client-side router can take over. This is
+    # what makes `https://paur.5seg.top/packages/<name>` work
+    # on hard reload.
+    handle {
+        rewrite * /index.html
+        file_server
     }
 }
 

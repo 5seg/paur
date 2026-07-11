@@ -71,8 +71,19 @@ build_local() {
     fi
 
     echo "==> paur: building local PKGBUILD"
-    rm -rf /work/build
-    cp -r /work/src /work/build
+    # /work/build is a fresh tmpfs (or scratch dir) supplied by the
+    # host on each invocation, so it never has leftover content to
+    # clean up. Trying to `rm -rf` it from inside the container
+    # would fail with "Device or resource busy" because it's a
+    # mount point.
+    #
+    # The trailing `/.` is important: `cp -r /work/src /work/build`
+    # would copy the contents into `/work/build/src/` (because
+    # /work/build is itself a directory) and makepkg would then
+    # look for `/work/build/PKGBUILD` and not find it. Copying the
+    # *contents* of /work/src straight into /work/build gives us
+    # `/work/build/PKGBUILD` and `/work/build/paur.pubkey.asc`.
+    cp -r /work/src/. /work/build/
     cd /work/build
 
     if [[ "${PAUR_RUST_CGU:-0}" == "1" ]]; then
@@ -80,21 +91,35 @@ build_local() {
         echo "==> paur: RUSTFLAGS=${RUSTFLAGS} (codegen-units=1)"
     fi
 
-    makepkg \
+    # Force PKGDEST to the current directory (where the PKGBUILD
+    # was copied to). makepkg's default of `$startdir` ought to
+    # match, but the bind-mounted /work dir interacts oddly with
+    # the container's WORKDIR (which we no longer set in the
+    # Dockerfile but some user images may still have), so we set
+    # PKGDEST explicitly.
+    PKGDEST="$PWD" makepkg \
         --syncdeps \
         --noconfirm \
         --cleanbuild \
         --skippgpcheck \
         --log \
-        --noarchive
+        --nosign
 
-    # --noarchive stops makepkg from creating the .pkg.tar.* — we
-    # package it ourselves below so we can sign with the daemon's
-    # GPG key (makepkg signs with whatever happens to be in the
-    # container's keyring, which is *not* what we want for a
-    # release artifact).
+    # --nosign stops makepkg from creating a pacman GPG signature
+    # (the container's keyring either doesn't exist or has the wrong
+    # key). The daemon signs the artifact with the host keyring in
+    # `paur_repo::publish` after repo-add; this is the same path
+    # regular AUR builds take. We do *not* use `--noarchive` because
+    # the existing `move_artifacts` logic expects the .pkg.tar.* on
+    # disk.
     shopt -s nullglob
+    # Look for .pkg.tar.* first in /work/build (the expected place),
+    # then fall back to the entire /work tree in case PKGDEST got
+    # overridden by something downstream of the script.
     artifacts=( *.pkg.tar.* )
+    if (( ${#artifacts[@]} == 0 )); then
+        artifacts=( /work/*.pkg.tar.* /work/*/*.pkg.tar.* )
+    fi
     if (( ${#artifacts[@]} == 0 )); then
         echo "==> paur: makepkg produced no .pkg.tar.* (build failed?)" >&2
         exit 2

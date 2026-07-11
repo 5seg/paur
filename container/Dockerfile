@@ -29,7 +29,13 @@ RUN useradd -m -G wheel builder \
 # these). ccache is bind-mounted separately so its contents survive
 # across builds.
 VOLUME ["/work", "/ccache"]
-WORKDIR /work
+# Intentionally do NOT set WORKDIR here. The bind-mounted /work dir
+# is owned by the host's paur user (mode 0o777) but with WORKDIR=/work
+# some makepkg invocations resolve PKGDEST relative to /work
+# regardless of the script's `cd` step, dumping .pkg.tar.* into
+# the bind mount root rather than the per-build subdir. Setting
+# cwd explicitly inside build.sh (`cd /work/build` etc.) is
+# more reliable.
 
 # Entry point lives at a stable path so the host can invoke it
 # directly via `docker run ... paur-builder /build.sh <pkg> <aur_url>`.

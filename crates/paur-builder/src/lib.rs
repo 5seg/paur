@@ -392,6 +392,12 @@ pub struct LocalBuildRequest {
     /// Per-build work directory; the daemon (or CLI) hands out a
     /// fresh one.
     pub work_dir: PathBuf,
+    /// Host path to a scratch directory mounted as `/work/build`
+    /// inside the container. This is a fresh `mktemp -d` per
+    /// invocation so makepkg can write its `pkg/`/`src/` trees and
+    /// the final `.pkg.tar.*` without conflicting with leftover
+    /// files from a previous run.
+    pub tmp_build_dir: PathBuf,
     /// ccache dir to bind-mount into the container.
     pub ccache_dir: PathBuf,
     /// Container runtime to invoke.
@@ -424,12 +430,42 @@ pub async fn run_local_in_container(
     let bin = req.runtime.binary();
     let mut cmd = Command::new(bin);
     cmd.args(["run", "--rm"])
+        // Mount the work dir at /work so the container's `builder`
+        // user has a writable root to copy the PKGBUILD into. The
+        // Dockerfile declares `VOLUME ["/work"]`, which without a
+        // bind mount creates an anonymous root-owned volume that
+        // `builder` cannot write to. Mounting first lets the more
+        // specific /work/src and /work/out mounts layer on top.
+        .arg("-v")
+        .arg(format!("{}:/work", req.work_dir.display()))
+        // Layer a tmpfs at /work/build on top of the work-dir
+        // bind mount. makepkg's `pkg/` and `src/` trees (and the
+        // .pkg.tar.* output) live in /work/build; keeping them in
+        // a tmpfs avoids two issues we hit with the work_dir bind
+        // mount:
+        //   1. The host-side work_dir is owned by paur with mode
+        //      0o777, but makepkg's intermediate files end up
+        //      owned by the container's `builder` uid, which
+        //      leaves stray files at the work_dir root between
+        //      builds.
+        //   2. makepkg resolves PKGDEST relative to its view of
+        //      "the work dir" — when /work is itself a bind mount,
+        //      some makepkg versions put .pkg.tar.* at /work
+        //      instead of /work/build. Putting /work/build on a
+        //      tmpfs makes that location a fresh, owned-by-builder
+        //      directory every time.
+        // The output is collected by build.sh and moved to
+        // /work/out (which is layered back over the host's
+        // work_dir/out).
+        .arg("-v")
+        .arg(format!("{}:/work/build:rw", req.tmp_build_dir.display()))
         // /work/src is the PKGBUILD dir; the local-build entrypoint
-        // is hardcoded to look there.
+        // is hardcoded to look there. Mounted read-only because
+        // makepkg copies it into /work/build before building.
         .arg("-v")
         .arg(format!("{}:/work/src:ro", req.pkgbuild_dir.display()))
         .arg("-v")
-        .arg(format!("{}:/work/out", req.work_dir.display()))
+        .arg(format!("{}:/work/out", req.work_dir.join("out").display()))
         .arg("-v")
         .arg(format!("{}:/ccache", req.ccache_dir.display()))
         .arg("-e")
