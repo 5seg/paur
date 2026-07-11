@@ -250,32 +250,33 @@ async fn set_package_auto(
 /// tuning flags. Admin-only: changing build behavior for tracked
 /// packages should require a deliberate action.
 ///
-/// The body is a `PackageBuildFlags` JSON object. The daemon
-/// composes the patch with the existing flags: any field sent as
-/// `true` becomes active, `false` is a no-op (use the dedicated
-/// `DELETE /flags/:key` endpoint to clear individual flags, or
-/// send the desired full state — kept for the next iteration).
+/// The body is a `PackageBuildFlags` JSON object that describes
+/// the *full desired state*. Every field is read; sending `false`
+/// turns a flag off. The UI sends the full object on each toggle
+/// so the server never has to know which key was clicked. An
+/// `Option<PackageBuildFlags>` (true = clear, false = set) shape
+/// would be more efficient on the wire, but a full-state write
+/// keeps the API stateless and trivially correct.
 async fn set_package_flags(
     State(state): State<Arc<AppState>>,
     _admin: Admin,
     Path(name): Path<String>,
-    Json(patch): Json<paur_core::PackageBuildFlags>,
+    Json(desired): Json<paur_core::PackageBuildFlags>,
 ) -> ApiResult<Json<PackageDto>> {
-    // Read the current flags, merge the patch in, write back. This
-    // is two queries but keeps the contract simple ("any field sent
-    // as true is enabled, anything else is preserved").
+    // We read the current row only to make sure the package
+    // exists; the write itself fully overwrites the flags column.
     let cur = state
         .db
         .get_package_by_name(&name)
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
-    let mut merged = cur.build_flags.clone();
-    merged.merge_from(&patch);
-    let n = state.db.set_build_flags(&name, &merged).await?;
+    let mut next = cur.build_flags.clone();
+    next.replace_from(&desired);
+    let n = state.db.set_build_flags(&name, &next).await?;
     if n == 0 {
         return Err(ApiError(paur_core::Error::NotFound(name.clone())));
     }
-    tracing::info!(pkg = %name, ?merged, "build_flags updated via API");
+    tracing::info!(pkg = %name, ?next, "build_flags updated via API");
     let p = state
         .db
         .get_package_by_name(&name)

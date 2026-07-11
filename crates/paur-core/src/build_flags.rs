@@ -59,9 +59,10 @@ impl PackageBuildFlags {
         !self.low_memory && !self.rust_codegen_units_1 && !self.no_ccache
     }
 
-    /// Merge `other` into `self`: any field set in `other` wins.
-    /// Used by the PATCH /flags endpoint so callers can update
-    /// one flag at a time without resending the whole struct.
+    /// Merge `other` into `self`: any field set in `other` wins,
+    /// and `false` is a no-op (does not clear). Used by `paur-cli`
+    /// when toggling a single flag on, and by callers that only
+    /// ever set flags to `true`.
     pub fn merge_from(&mut self, other: &PackageBuildFlags) {
         if other.low_memory {
             self.low_memory = true;
@@ -72,6 +73,15 @@ impl PackageBuildFlags {
         if other.no_ccache {
             self.no_ccache = true;
         }
+    }
+
+    /// Replace every field of `self` with the corresponding field
+    /// of `other`. Used by the PATCH /flags endpoint so the client
+    /// can describe the full desired state and turn flags off.
+    pub fn replace_from(&mut self, other: &PackageBuildFlags) {
+        self.low_memory = other.low_memory;
+        self.rust_codegen_units_1 = other.rust_codegen_units_1;
+        self.no_ccache = other.no_ccache;
     }
 }
 
@@ -159,5 +169,42 @@ mod tests {
         let b = PackageBuildFlags::default();
         a.merge_from(&b);
         assert!(a.low_memory, "merge_from must not clear existing flags");
+    }
+
+    #[test]
+    fn replace_clears_flags() {
+        // replace_from mirrors the full desired state, including
+        // turning flags off. The PATCH /flags endpoint uses this so
+        // a client can describe the complete state of the toggles
+        // it just rendered and have the server reflect that — e.g.
+        // sending {low_memory: false, ...} must turn low_memory off.
+        let mut a = PackageBuildFlags {
+            low_memory: true,
+            rust_codegen_units_1: true,
+            no_ccache: true,
+        };
+        let b = PackageBuildFlags {
+            low_memory: false,
+            rust_codegen_units_1: false,
+            no_ccache: false,
+        };
+        a.replace_from(&b);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn replace_preserves_unmentioned() {
+        // Unlike a Partial JSON body, replace_from takes a
+        // fully-deserialized PackageBuildFlags so every field is
+        // mentioned. The default is `false`; a UI that always
+        // sends a complete state thus effectively clears unused
+        // keys without needing an extra DELETE endpoint.
+        let mut a = PackageBuildFlags {
+            low_memory: true,
+            ..Default::default()
+        };
+        let b = PackageBuildFlags::default();
+        a.replace_from(&b);
+        assert!(a.is_empty());
     }
 }

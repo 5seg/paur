@@ -226,6 +226,9 @@ pub async fn flag(
     no_ccache: Option<bool>,
 ) -> Result<(), CmdError> {
     let name = PkgName::new(pkg)?;
+    // `list` is now handled by `paur-cli get`; we keep the legacy
+    // flag here for back-compat. If no toggle flags were passed
+    // either way, we just print the current state.
     if list
         || (low_memory.is_none() && rust_codegen_units_1.is_none() && no_ccache.is_none())
     {
@@ -237,9 +240,13 @@ pub async fn flag(
         return Ok(());
     }
 
-    // Build the patch. Only fields explicitly set in this invocation
-    // are sent; existing `true` fields are preserved by the daemon.
-    let mut update = paur_core::PackageBuildFlags::default();
+    // The PATCH /flags endpoint takes a *full* desired state, not
+    // a partial patch. Read the current flags, apply the
+    // user-provided overrides, and send the merged result. This
+    // matches the WebUI's behaviour and lets the CLI explicitly
+    // turn a flag off (`paur-cli flag <pkg> --low-memory false`).
+    let current = client.get_package(name.as_str()).await?;
+    let mut update = current.build_flags;
     if let Some(v) = low_memory {
         update.low_memory = v;
     }
