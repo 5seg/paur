@@ -2,6 +2,11 @@
 export default {
   darkMode: 'class',
   content: ['./src/**/*.{html,js,svelte,ts}'],
+  safelist: [
+    // badge/status-dot variants are interpolated in StatusBadge.svelte
+    { pattern: /badge-(queued|running|success|failed|cancelled)/ },
+    { pattern: /status-dot-(queued|running|success|failed|cancelled)/ }
+  ],
   theme: {
     extend: {
       colors: {
