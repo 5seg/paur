@@ -82,9 +82,15 @@
     const prev = currentFlags();
     const next: PackageBuildFlags = { ...prev, [key]: !prev[key] };
     pendingFlag = { ...pendingFlag, [key]: true };
+    // Optimistically reflect the new state in the UI, then send
+    // the *full* expected state to the daemon. The daemon merges
+    // the patch with the current flags; sending every key makes
+    // it possible to turn a flag *off* (otherwise `false` would
+    // be a no-op on the server and the UI could never disable
+    // a flag once enabled).
     pkg = { ...pkg, build_flags: next };
     try {
-      pkg = await api.setBuildFlags(pkg.name, { [key]: true } as Partial<PackageBuildFlags>);
+      pkg = await api.setBuildFlags(pkg.name, next);
     } catch (e) {
       pkg = pkg ? { ...pkg, build_flags: prev } : pkg;
       if (e instanceof ApiError && e.status === 401) {

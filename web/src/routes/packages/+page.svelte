@@ -15,6 +15,8 @@
   let submitting = $state(false);
   let submitError = $state<string | null>(null);
 
+  onMount(refresh);
+
   async function refresh() {
     try {
       pkgs = await api.listPackages();
