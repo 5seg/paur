@@ -11,9 +11,10 @@
 //!   responds 401, a session whose login is required (no password set
 //!   yet) responds 503 with a hint to run `paur passwd`.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -172,6 +173,19 @@ impl FromRequestParts<Arc<AppState>> for Admin {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
+        // Skip the session check entirely for loopback callers. The
+        // build host's `paur-cli` reaches the daemon over the
+        // loopback interface (the daemon's `listen` is pinned to
+        // 127.0.0.1 in practice, and even when it isn't, anything
+        // that can already speak to a loopback-only socket is by
+        // definition local to the box). Caddy reverse-proxies
+        // external traffic through 127.0.0.1 too, but those
+        // requests pass through the session-cookie gate just like
+        // a remote client would.
+        if is_loopback(parts) {
+            return Ok(Admin);
+        }
+
         // If the admin password has never been set, every write must
         // fail closed with a hint to run `paur passwd`. We check this
         // before accepting any session, because a session issued
@@ -193,6 +207,23 @@ impl FromRequestParts<Arc<AppState>> for Admin {
             Ok(None) => Err(AuthHttpError::Unauthenticated.into_response()),
             Err(e) => Err(e.into_response()),
         }
+    }
+}
+
+/// True when the TCP peer for this request is a loopback address.
+///
+/// Called from `Admin::from_request_parts` to bypass the session
+/// gate for `paur-cli` running on the build host. We resolve the
+/// peer address via axum's `ConnectInfo` extension, which the
+/// daemon attaches to every request via
+/// `into_make_service_with_connect_info`.
+fn is_loopback(parts: &Parts) -> bool {
+    let Some(info) = parts.extensions.get::<ConnectInfo<SocketAddr>>() else {
+        return false;
+    };
+    match info.0.ip() {
+        IpAddr::V4(v4) => v4 == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(v6) => v6 == Ipv6Addr::LOCALHOST,
     }
 }
 

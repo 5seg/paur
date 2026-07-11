@@ -69,7 +69,17 @@ pub async fn serve(cfg: &paur_core::Config, state: AppState) -> Result<(), paur_
     };
     let listener = TcpListener::bind(addr).await.map_err(paur_core::Error::Io)?;
     tracing::info!(%addr, "paur: HTTP API listening on TCP");
-    axum::serve(listener, app).await.map_err(paur_core::Error::Io)
+    // `into_make_service_with_connect_info` exposes the peer
+    // `SocketAddr` to extractors so `auth::Admin` can skip the
+    // session check for loopback callers (the `paur-cli` running on
+    // the build host). Without this, every internal call from the
+    // CLI would 401 because there's no cookie store.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(paur_core::Error::Io)
 }
 
 // -------- error helper --------
