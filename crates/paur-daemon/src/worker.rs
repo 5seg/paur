@@ -94,6 +94,19 @@ pub async fn run(state: AppState, max_workers: u32) -> Result<(), paur_core::Err
         tracing::warn!(reaped = n, "reaped stale running builds from previous run");
     }
 
+    // Self-heal: if the served pubkey is missing from the arch
+    // dir, re-export it from the stored GPG key id. This file is
+    // what `/api/v1/install/fpr` and the keyring meta-package
+    // both depend on, so its absence is user-visible (the
+    // install page's "Resolve FPR" button would 404). It can
+    // disappear if a `rsync --delete` over the repo dir is
+    // pointed at the wrong source, or if `paur-cli init` was
+    // run in a way that didn't write it. Re-exporting is cheap
+    // and idempotent.
+    if let Err(e) = ensure_served_pubkey(&state).await {
+        tracing::warn!("could not self-heal served pubkey: {e}");
+    }
+
     // The worker reads build ids off `rx`. Two sources can put ids
     // there: the HTTP API (which sends into `state.wake`) and the
     // one-shot kicker that scans the DB on startup. We bridge both
@@ -303,6 +316,44 @@ struct DbLogSink {
     state: AppState,
     build_id: i64,
     seq: std::sync::atomic::AtomicI64,
+}
+
+/// Make sure `<arch_dir>/paur.pubkey.asc` is on disk and matches
+/// the GPG key id stored in the `settings` table. This is the
+/// file the Install page's "Resolve FPR" button and the
+/// `paur-keyring` meta-package both read, so its absence is
+/// user-visible.
+///
+/// `paur-cli init` is what *should* keep this file in sync, but
+/// it has no reason to run on a normal daemon restart — and an
+/// operator who runs `rsync --delete` against `<data_dir>/repo/`
+/// (with the wrong source) can wipe it without the daemon ever
+/// noticing. Rather than ask the operator to remember to
+/// re-export, we just do it ourselves at startup whenever the
+/// file is missing. Re-exporting is cheap and the key material
+/// is already on disk in `cfg.gpg_home`.
+async fn ensure_served_pubkey(state: &AppState) -> Result<(), paur_core::Error> {
+    let pubkey_path: PathBuf = state.repo.arch_dir().join("paur.pubkey.asc");
+    if pubkey_path.exists() {
+        return Ok(());
+    }
+    let keyid = state
+        .db
+        .get_setting("gpg_key_id")
+        .await?
+        .ok_or_else(|| {
+            paur_core::Error::Invalid(
+                "no gpg_key_id in settings; run `paur-cli init`".into(),
+            )
+        })?;
+    if keyid.is_empty() {
+        return Err(paur_core::Error::Invalid(
+            "gpg_key_id in settings is empty; run `paur-cli init`".into(),
+        ));
+    }
+    paur_repo::export_pubkey(&state.cfg.gpg_home, &keyid, &pubkey_path).await?;
+    tracing::info!(?pubkey_path, %keyid, "self-healed served pubkey");
+    Ok(())
 }
 
 impl DbLogSink {
