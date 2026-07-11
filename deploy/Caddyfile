@@ -14,22 +14,33 @@
 # the deployer's uid, then the daemon could not create
 # `repo/x86_64/` and died at startup.
 #
+# This file matches `deploy/Caddyfile.public` for behaviour
+# (no ACME, TLS terminated in front by Cloudflare or another
+# proxy). Caddy 2.6+ no longer accepts `auto_https on`; it wants
+# an explicit off / disable_* / ignore_loaded_certs keyword. The
+# earlier "on" form silently succeeded on 2.6.x pre-config, so
+# the difference between the two files used to be a no-op; we
+# now spell it the way 2.6+ wants.
+#
 # Adjust `root` and the bind address to taste. This config assumes
 # the daemon is listening on the loopback fallback (127.0.0.1:7300)
-# since axum 0.7 doesn't accept a unix listener.
-#
-# If you'd rather terminate TLS in front of Caddy (Cloudflare, an
-# internal proxy, etc.), use `deploy/Caddyfile.public` instead —
-# this file expects Caddy to fetch and renew its own Let's Encrypt
-# certs on :443.
+# since axum 0.7 doesn't accept a unix listener. If you want a
+# self-contained Caddy that fetches and renews its own Let's
+# Encrypt cert, copy this file and add an `email` block inside
+# the global `{ ... }` along with the hostnames you want to
+# serve; Caddy will then ignore the `auto_https off` and run ACME
+# on first request.
 
 {
-    # auto_https off if you'd rather terminate TLS yourself.
-    auto_https on
+    auto_https off
+    servers {
+        protocols h1 h2c
+    }
 }
 
-# Primary site. Replace `paur.example` with your hostname.
-paur.example, https://paur.example {
+# Replace `paur.example` with your hostname. The other two are
+# conveniences for testing directly on the build host.
+paur.example, http://localhost, http://xserver {
     # Where the SvelteKit `npm run build` output lives. This
     # directory is owned by the deployer (root or your user) and
     # only ever written by the deploy step. The daemon never

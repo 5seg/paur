@@ -9,14 +9,15 @@
 # itself, use the stock `deploy/Caddyfile` instead.
 #
 # Layout (after DNS + TLS termination lands):
-#   /                 → static SvelteKit UI (built into web/build/)
+#   /                 → static SvelteKit UI, served from <data_dir>/webui
 #   /api/v1/*         → the daemon's HTTP API
 #   /repo/$arch/*     → the published pacman repo (signed .pkg.tar.zst,
 #                      paur.db.tar.gz, .sig, paur.pubkey.asc)
 #
 # This config assumes the daemon is listening on 127.0.0.1:7300
-# (axum 0.7's TCP fallback) and the static UI is at
-# <data_dir>/web/build (typically the result of `npm run build`).
+# (axum 2.7's TCP fallback) and the static UI has been deployed
+# into <data_dir>/webui (typically the result of
+# `sudo rsync -a --delete web/build/ /var/lib/paur/webui/`).
 #
 # Usage:
 #   /etc/caddy/Caddyfile:
@@ -38,12 +39,13 @@
 # Replace `paur.5seg.top` with your hostname. The other two are
 # conveniences for testing directly on the build host.
 http://paur.5seg.top, http://localhost, http://xserver {
-    # Where the SvelteKit `npm run build` output lives. Must be
-    # readable by the caddy user (typically 0755 directories,
-    # 0644 files). If you place the build under `/home/<user>/...`,
-    # also `chmod o+x /home/<user>` so the caddy user can traverse
-    # to the build directory.
-    root * /home/user/paur/web/build
+    # Where the SvelteKit `npm run build` output lives. This
+    # directory is owned by the deployer (root or your user) and
+    # only ever written by the deploy step. The daemon never
+    # touches it; see the header in `deploy/Caddyfile` for why
+    # we keep it separate from `repo/`. Must be readable by the
+    # caddy user (typically 0755 directories, 0644 files).
+    root * /var/lib/paur/webui
 
     encode zstd gzip
 
