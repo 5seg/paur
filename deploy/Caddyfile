@@ -38,9 +38,15 @@
     }
 }
 
-# Replace `paur.example` with your hostname. The other two are
-# conveniences for testing directly on the build host.
-paur.example, http://localhost, http://xserver {
+# Primary site. Replace `paur.example` with your hostname. Bare
+# hostnames (no scheme) here mean "match this Host header on
+# whatever port the listener is bound to". Writing the host with
+# an `http://` prefix asks Caddy to treat it as a virtual host
+# for HTTPS, which interacts badly with `auto_https off` and
+# routes any other method on those hosts into the default site
+# (which is empty here) — observed as GETs returning SPA
+# index.html and PATCH / POST returning 404.
+paur.example, localhost, xserver {
     # Where the SvelteKit `npm run build` output lives. This
     # directory is owned by the deployer (root or your user) and
     # only ever written by the deploy step. The daemon never

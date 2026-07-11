@@ -37,8 +37,13 @@
 }
 
 # Replace `paur.5seg.top` with your hostname. The other two are
-# conveniences for testing directly on the build host.
-http://paur.5seg.top, http://localhost, http://xserver {
+# conveniences for testing directly on the build host. Bare
+# hostnames (no `http://` prefix) match the Host header on
+# whatever port the listener is bound to. The same rule applies
+# here as in `deploy/Caddyfile` — using `http://localhost` and
+# `http://xserver` instead causes PATCH/POST on those hosts to
+# fall into Caddy's default (empty) site and 404.
+http://paur.5seg.top, localhost, xserver {
     # Where the SvelteKit `npm run build` output lives. This
     # directory is owned by the deployer (root or your user) and
     # only ever written by the deploy step. The daemon never
