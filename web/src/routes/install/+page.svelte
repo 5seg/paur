@@ -44,8 +44,8 @@
 
   const repoRoot = $derived(`${location.protocol}//${host}/repo/${arch}`);
 
-  function block(n: number, cmd: string) {
-    return { n, cmd };
+  function block(n: number, title: string, cmd: string) {
+    return { n, title, cmd };
   }
 
   const blocks = $derived([
@@ -57,6 +57,7 @@
     //    click first.
     block(
       0,
+      'Find the FPR',
       `# Find this server's GPG fingerprint (40 hex chars)
 FPR=$(curl -sSL ${repoRoot}/paur.pubkey.asc \\
         | gpg --import-options show-only --import 2>/dev/null \\
@@ -68,6 +69,7 @@ echo "$FPR"`
     //    passphrase, which defaults to empty on a fresh install.
     block(
       1,
+      'Bootstrap GPG key',
       `# Bootstrap: add the pubkey to the local keyring and lsign it.
 sudo pacman-key --add <(curl -sSL ${repoRoot}/paur.pubkey.asc)
 sudo pacman-key --lsign-key "$FPR"`
@@ -79,6 +81,7 @@ sudo pacman-key --lsign-key "$FPR"`
     //    trust.
     block(
       2,
+      'Install keyring + mirrorlist',
       `# Install the keyring + mirrorlist meta-packages.
 sudo pacman -U --noconfirm '${repoRoot}/paur-keyring-1-1-any.pkg.tar.zst'
 sudo pacman -U --noconfirm '${repoRoot}/paur-mirrorlist-1-1-any.pkg.tar.zst'`
@@ -86,6 +89,7 @@ sudo pacman -U --noconfirm '${repoRoot}/paur-mirrorlist-1-1-any.pkg.tar.zst'`
     // 3. Enable the repo + first sync.
     block(
       3,
+      'Enable in pacman.conf',
       `# Enable the repo in pacman.conf.
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
@@ -154,11 +158,11 @@ sudo pacman -Sy hello-pkg`
   {/if}
 </div>
 
-<div class="space-y-4">
+<div class="space-y-2">
   {#each blocks as b (b.n)}
-    <div class="rounded-lg border p-4" style="background: var(--bg-card); border-color: var(--hairline);">
+    <div class="rounded-md border p-3" style="background: var(--bg-card); border-color: var(--hairline);">
       <div class="mb-2 flex items-center justify-between">
-        <span class="text-xs font-medium" style="color: var(--mute);">Step {b.n}</span>
+        <span class="text-[11px] uppercase tracking-wide" style="color: var(--mute);">{#if b.title}{b.title}{/if}</span>
         <button
           class="btn"
           type="button"
