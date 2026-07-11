@@ -172,6 +172,33 @@ If you'd rather have Caddy fetch and renew its own certificate
 (via Let's Encrypt), use the stock `deploy/Caddyfile` and let
 port 443 reach the host directly.
 
+### 10a. Deploy the static UI
+
+The Caddy config (both `deploy/Caddyfile` and
+`deploy/Caddyfile.public`) serves `/` from `<data_dir>/webui/`.
+This directory is **only** written by the deployer (you or your
+CI); the daemon never touches it. The two write sites of paur
+must stay separate:
+
+- `<data_dir>/webui/` — owned by the deployer
+- `<data_dir>/repo/`   — owned by the `paur` service user (the
+  daemon writes package files and the repo DB into it)
+
+Mixing them — e.g. `rsync`-ing the UI into `<data_dir>/repo/`
+because that's where Caddy was originally pointed — has caused
+recurring crashes: rsync sets the root to the deployer's uid,
+and on the next restart the daemon can't create `repo/x86_64/`.
+
+```sh
+sudo install -d -m0755 /var/lib/paur/webui
+(cd /opt/paur-src/web && npm ci && npm run build)
+sudo rsync -a --delete /opt/paur-src/web/build/ /var/lib/paur/webui/
+```
+
+Re-run this step whenever you ship UI changes. `--delete` is
+important so stale `_app/` chunks don't keep clients pinned to
+old bundles.
+
 ## 11. DNS and TLS (your part)
 
 Point `paur.5seg.top` at the host's public IP, then put a TLS

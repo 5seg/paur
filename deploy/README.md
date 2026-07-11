@@ -84,6 +84,22 @@ A short field guide for going from a clean Arch host to a working
    the daemon's HTTP API is at `127.0.0.1:7300/api/v1/*` and the repo
    is at `/var/lib/paur/repo/x86_64/`.
 
+9. **Deploy the static UI** into `<data_dir>/webui/`. This is the
+   directory `deploy/Caddyfile` serves `/` from. The deployer (you,
+   or your CI) is the *only* writer of this directory; the daemon
+   never touches it. Keep them separate so a `chown` mistake during
+   deploy can't crash the daemon by making `repo/` unwritable.
+
+   ```sh
+   sudo install -d -m0755 /var/lib/paur/webui
+   (cd web && npm ci && npm run build)
+   sudo rsync -a --delete web/build/ /var/lib/paur/webui/
+   ```
+
+   Re-run this step whenever you ship UI changes. `--delete` is
+   important so stale `_app/` chunks don't keep clients pinned to
+   old bundles.
+
 ## Adding packages
 
 From any host that can reach the daemon:

@@ -1,10 +1,18 @@
 # Caddyfile for paur.
 #
-# Layout:
-#   /                 → static SvelteKit UI (built into web/build/)
+# Layout (after `webui` is populated; see `deploy/README.linux.md`):
+#   /                 → static SvelteKit UI, served from <data_dir>/webui
 #   /api/v1/*         → the daemon's HTTP API
 #   /repo/$arch/*     → the published pacman repo (signed .pkg.tar.zst,
 #                      paur.db.tar.gz, .sig, paur.pubkey.asc)
+#
+# Why two separate roots? `webui/` is owned by the deployer (the
+# user running `npm run build` + rsync), while `repo/` is owned
+# by the daemon's service user (paur) because the daemon writes
+# package files and the repo DB into it. Mixing them in one
+# directory caused a recurring crash: rsync would set the root to
+# the deployer's uid, then the daemon could not create
+# `repo/x86_64/` and died at startup.
 #
 # Adjust `root` and the bind address to taste. This config assumes
 # the daemon is listening on the loopback fallback (127.0.0.1:7300)
@@ -22,12 +30,13 @@
 
 # Primary site. Replace `paur.example` with your hostname.
 paur.example, https://paur.example {
-    # Where the SvelteKit `npm run build` output lives. Must be
-    # readable by the caddy user (typically 0755 directories,
-    # 0644 files). If you place the build under `/home/<user>/...`,
-    # also `chmod o+x /home/<user>` so the caddy user can traverse
-    # to the build directory.
-    root * /var/lib/paur/web
+    # Where the SvelteKit `npm run build` output lives. This
+    # directory is owned by the deployer (root or your user) and
+    # only ever written by the deploy step. The daemon never
+    # touches it; see the header comment for why we keep it
+    # separate from `repo/`. Must be readable by the caddy user
+    # (typically 0755 directories, 0644 files).
+    root * /var/lib/paur/webui
 
     encode zstd gzip
 
