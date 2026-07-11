@@ -80,7 +80,7 @@ impl Db {
     /// Look up a package by its canonical name.
     pub async fn get_package_by_name(&self, name: &str) -> paur_core::Result<Option<Package>> {
         let row = sqlx::query(
-            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild
+            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags
              FROM packages WHERE name = ?",
         )
         .bind(name)
@@ -93,7 +93,7 @@ impl Db {
     /// List all packages, newest first.
     pub async fn list_packages(&self) -> paur_core::Result<Vec<Package>> {
         let rows = sqlx::query(
-            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild
+            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags
              FROM packages ORDER BY added_at DESC",
         )
         .fetch_all(&self.pool)
@@ -134,27 +134,75 @@ impl Db {
         Ok(())
     }
 
+    /// Toggle `auto_rebuild` flag. Returns the number of rows affected
+    /// (0 if the package does not exist, 1 otherwise).
+    pub async fn set_auto_rebuild(&self, name: &str, auto: bool) -> paur_core::Result<u64> {
+        let res = sqlx::query("UPDATE packages SET auto_rebuild = ? WHERE name = ?")
+            .bind(auto as i64)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
+    /// Replace the `build_flags` JSON blob for a package. Returns
+    /// the number of rows affected (0 if the package does not
+    /// exist). The flags are serialized with serde_json.
+    pub async fn set_build_flags(
+        &self,
+        name: &str,
+        flags: &paur_core::PackageBuildFlags,
+    ) -> paur_core::Result<u64> {
+        let blob = serde_json::to_string(flags)
+            .map_err(|e| paur_core::Error::Db(format!("serialize build_flags: {e}")))?;
+        let res = sqlx::query("UPDATE packages SET build_flags = ? WHERE name = ?")
+            .bind(blob)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
     // -------- builds --------
 
     /// Enqueue a new build for a package. The build is created in
-    /// `queued` state with the given trigger.
+    /// `queued` state with the given trigger. The per-package `seq`
+    /// number is allocated inside the same transaction so two
+    /// concurrent enqueues for the same package cannot collide.
     pub async fn enqueue_build(
         &self,
         package_id: i64,
         trigger: BuildTrigger,
     ) -> paur_core::Result<i64> {
         let now = Self::now();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // Allocate the next seq for this package. Read-then-insert
+        // is racy across transactions in general, but the
+        // UNIQUE(package_id, seq) index plus the tx isolation makes
+        // a duplicate impossible: a losing transaction gets a
+        // UNIQUE-constraint error, which we surface to the caller.
+        let next_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM builds WHERE package_id = ?",
+        )
+        .bind(package_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
         let row = sqlx::query(
-            "INSERT INTO builds (package_id, status, queued_at, trigger)
-             VALUES (?, 'queued', ?, ?)
+            "INSERT INTO builds (package_id, status, queued_at, trigger, seq)
+             VALUES (?, 'queued', ?, ?, ?)
              RETURNING id",
         )
         .bind(package_id)
         .bind(now)
         .bind(trigger.as_str())
-        .fetch_one(&self.pool)
+        .bind(next_seq)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(row.get::<i64, _>(0))
     }
 
@@ -165,7 +213,7 @@ impl Db {
         let now = Self::now();
         // Pick the oldest queued build.
         let row = sqlx::query(
-            "SELECT id, package_id, status, queued_at, started_at, finished_at, exit_code,
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
                     pkg_file, pkg_version, worker_id, trigger
              FROM builds WHERE status = 'queued'
              ORDER BY queued_at ASC, id ASC LIMIT 1",
@@ -187,11 +235,53 @@ impl Db {
         .map_err(db_err)?;
         // Re-read the now-running row.
         let row = sqlx::query(
-            "SELECT id, package_id, status, queued_at, started_at, finished_at, exit_code,
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
                     pkg_file, pkg_version, worker_id, trigger
              FROM builds WHERE id = ?",
         )
         .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(row_to_build(&row)))
+    }
+
+    /// Claim a specific build id atomically. Only succeeds when the
+    /// row is currently `queued`; returns `None` if the id is missing
+    /// or already running/finished. Used by the worker when the
+    /// poller/API wake a specific id: the wake payload is the
+    /// authoritative request, so we honor it instead of falling back
+    /// to "oldest queued".
+    pub async fn claim_build_by_id(
+        &self,
+        build_id: i64,
+        worker_id: &str,
+    ) -> paur_core::Result<Option<Build>> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let now = Self::now();
+        let res = sqlx::query(
+            "UPDATE builds SET status = 'running', started_at = ?, worker_id = ?
+             WHERE id = ? AND status = 'queued'",
+        )
+        .bind(now)
+        .bind(worker_id)
+        .bind(build_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if res.rows_affected() == 0 {
+            // Either the id doesn't exist, or it's not in `queued`
+            // state (already running, finished, or stale). Skip.
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
+                    pkg_file, pkg_version, worker_id, trigger
+             FROM builds WHERE id = ?",
+        )
+        .bind(build_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -236,7 +326,7 @@ impl Db {
     /// Fetch a build by id.
     pub async fn get_build(&self, id: i64) -> paur_core::Result<Option<Build>> {
         let row = sqlx::query(
-            "SELECT id, package_id, status, queued_at, started_at, finished_at, exit_code,
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
                     pkg_file, pkg_version, worker_id, trigger
              FROM builds WHERE id = ?",
         )
@@ -250,7 +340,7 @@ impl Db {
     /// Fetch the most recent build for a package, if any.
     pub async fn latest_build_for(&self, package_id: i64) -> paur_core::Result<Option<Build>> {
         let row = sqlx::query(
-            "SELECT id, package_id, status, queued_at, started_at, finished_at, exit_code,
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
                     pkg_file, pkg_version, worker_id, trigger
              FROM builds WHERE package_id = ?
              ORDER BY queued_at DESC, id DESC LIMIT 1",
@@ -271,7 +361,7 @@ impl Db {
     ) -> paur_core::Result<Vec<Build>> {
         // Build a query dynamically. For simplicity, branch on filters.
         let mut sql = String::from(
-            "SELECT b.id, b.package_id, b.status, b.queued_at, b.started_at, b.finished_at,
+            "SELECT b.id, b.package_id, b.seq, b.status, b.queued_at, b.started_at, b.finished_at,
                     b.exit_code, b.pkg_file, b.pkg_version, b.worker_id, b.trigger
              FROM builds b",
         );
@@ -404,11 +494,87 @@ impl Db {
             })
             .collect())
     }
+
+    // -------- sessions --------
+
+    /// Insert a new session. `token_hash` is the SHA-256 hex digest of
+    /// the token actually handed to the client; we never persist the
+    /// plaintext.
+    pub async fn create_session(
+        &self,
+        token_hash: &str,
+        user: &str,
+        expires_at: i64,
+    ) -> paur_core::Result<()> {
+        let now = Self::now();
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, created_at, expires_at, user)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .bind(expires_at)
+        .bind(user)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Look up a session by its hash. Returns the user (always
+    /// `"admin"`) when the row exists and is not expired.
+    pub async fn lookup_session(&self, token_hash: &str) -> paur_core::Result<Option<String>> {
+        let now = Self::now();
+        let row = sqlx::query(
+            "SELECT user FROM sessions
+             WHERE token_hash = ? AND expires_at > ?",
+        )
+        .bind(token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<String, _>(0)))
+    }
+
+    /// Delete a single session by hash. Used by `logout`.
+    pub async fn delete_session(&self, token_hash: &str) -> paur_core::Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Delete every session, regardless of expiry. Used after
+    /// rotating the admin password so any leaked cookies stop working.
+    pub async fn delete_all_sessions(&self) -> paur_core::Result<()> {
+        sqlx::query("DELETE FROM sessions")
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Sweep expired sessions. Cheap to call; returns rows removed.
+    pub async fn prune_expired_sessions(&self) -> paur_core::Result<u64> {
+        let now = Self::now();
+        let res = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
 }
 
 // -------- row mapping helpers --------
 
 fn row_to_package(r: sqlx::sqlite::SqliteRow) -> Package {
+    let flags_json: String = r.get::<Option<String>, _>(7).unwrap_or_else(|| "{}".into());
+    let build_flags: paur_core::PackageBuildFlags =
+        serde_json::from_str(&flags_json).unwrap_or_default();
     Package {
         id: r.get(0),
         name: r.get(1),
@@ -417,23 +583,25 @@ fn row_to_package(r: sqlx::sqlite::SqliteRow) -> Package {
         added_at: r.get(4),
         enabled: r.get::<i64, _>(5) != 0,
         auto_rebuild: r.get::<i64, _>(6) != 0,
+        build_flags,
     }
 }
 
 fn row_to_build(r: &sqlx::sqlite::SqliteRow) -> Build {
-    let status_s: String = r.get(2);
-    let trigger_s: String = r.get(10);
+    let status_s: String = r.get(3);
+    let trigger_s: String = r.get(11);
     Build {
         id: r.get(0),
         package_id: r.get(1),
+        seq: r.get(2),
         status: status_s.parse().unwrap_or(BuildStatus::Failed),
-        queued_at: r.get(3),
-        started_at: r.get(4),
-        finished_at: r.get(5),
-        exit_code: r.get(6),
-        pkg_file: r.get(7),
-        pkg_version: r.get(8),
-        worker_id: r.get(9),
+        queued_at: r.get(4),
+        started_at: r.get(5),
+        finished_at: r.get(6),
+        exit_code: r.get(7),
+        pkg_file: r.get(8),
+        pkg_version: r.get(9),
+        worker_id: r.get(10),
         trigger: trigger_s.parse().unwrap_or(BuildTrigger::Manual),
     }
 }

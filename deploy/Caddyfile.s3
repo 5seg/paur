@@ -1,0 +1,96 @@
+# Caddyfile for paur with S3 (or R2 / B2 / MinIO) as the artifact store.
+#
+# Use this when the daemon is configured with `[s3]` in paur.toml and
+# the bucket is reachable as an HTTPS endpoint (either the S3 public
+# website endpoint, a CloudFront / R2.dev public URL, or a custom
+# Cloudflare R2 custom domain).
+#
+# The daemon still signs everything locally and uploads the signed
+# objects to the bucket. Caddy's only job here is to put a clean
+# HTTPS / cache header in front of those objects so pacman clients
+# fetch them through one consistent URL.
+#
+# This file is intentionally minimal — it does *not* serve the
+# SvelteKit UI or the daemon API. Combine with `deploy/Caddyfile` if
+# you also want the UI/API fronted by Caddy; in that case import both
+# files and rename the repo host to a sub-path. The example below
+# shows the standalone variant.
+#
+# Layout:
+#   /repo/$arch/*  → reverse-proxied to <s3.public_url>
+#
+# Requirements:
+#   * The bucket is configured for public read on the keys paur writes
+#     (paur.db.tar.gz, paur.files.tar.gz, *.pkg.tar.zst, *.sig,
+#     paur.pubkey.asc).
+#   * The s3.public_url in paur.toml matches `<public_url>` below
+#     exactly, including the trailing path components, so the
+#     pacman.conf hint Caddy prints lines up with reality.
+#   * Caddy can reach the public URL (outbound 443). The S3 endpoint
+#     used by the daemon for writes can be a private network address;
+#     that's separate from this read path.
+#
+# Usage:
+#   1. Edit `public_url` below to your bucket's public URL.
+#   2. Place this file at /etc/caddy/Caddyfile.d/paur-s3.
+#   3. Caddy's main Caddyfile must `import /etc/caddy/Caddyfile.d/*`.
+
+# Set to the bucket's public read endpoint. Examples:
+#   AWS S3 website:    http://paur-repo.s3-website-us-east-1.amazonaws.com
+#   R2 public bucket:  https://pub-xxxxxxxxxxxxxxxxxxxxxxxxxxxx.r2.dev
+#   R2 custom domain:  https://paur.example
+#   MinIO (TLS):       https://minio.example
+#   CloudFront:        https://dxxxxxxxxxxxxx.cloudfront.net
+{
+    # auto_https on by default — Caddy fetches and renews LE certs for
+    # the hostname below. Switch off if you front Caddy with another
+    # TLS terminator.
+    auto_https on
+}
+
+# Replace `paur.example` with the hostname clients actually hit. The
+# objects are served at <public_url>, which can be a different
+# hostname (R2, CloudFront, etc.) — the public_url in paur.toml must
+# point at whichever one the public bucket is reachable at.
+paur.example, https://paur.example {
+    encode zstd gzip
+
+    # The actual artifacts. We deliberately do NOT cache: a fresh
+    # build should be visible to the next `pacman -Sy` without
+    # waiting for a CDN TTL. Bandwidth is paid; correctness wins.
+    @repo path /repo/*
+    handle @repo {
+        reverse_proxy https://<public_url> {
+            # S3/R2 returns 304 on If-Modified-Since; let Caddy
+            # forward that through to pacman.
+            header_up If-Modified-Since {http.request.header.If-Modified-Since}
+            header_up If-None-Match {http.request.header.If-None-Match}
+            header_down Cache-Control "no-cache, must-revalidate"
+            transport http {
+                tls
+                dial_timeout 5s
+                # Large packages can take a few seconds to start
+                # streaming; give them room.
+                response_header_timeout 30s
+            }
+        }
+    }
+
+    # The GPG public key and anything else not under /repo/* is
+    # proxied the same way so clients can `pacman-key --recv-keys
+    # https://paur.example/paur.pubkey.asc` style flows.
+    handle {
+        reverse_proxy https://<public_url> {
+            transport http {
+                tls
+                dial_timeout 5s
+            }
+        }
+    }
+}
+
+# Optional: a tiny health endpoint on the loopback so the daemon can
+# self-check that the reverse proxy is up. Bypasses S3 entirely.
+:8080/health {
+    respond "ok" 200
+}

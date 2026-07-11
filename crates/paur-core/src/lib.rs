@@ -6,13 +6,16 @@
 #![warn(missing_docs)]
 #![warn(rust_2024_compatibility)]
 
+pub mod auth;
+pub mod build_flags;
 pub mod config;
 pub mod error;
 pub mod logging;
 pub mod name;
 pub mod paths;
 
-pub use config::{Config, ContainerRuntime, Listen};
+pub use build_flags::PackageBuildFlags;
+pub use config::{Config, ContainerRuntime, Listen, S3Config};
 pub use error::{Error, Result};
 pub use name::PkgName;
 pub use paths::Paths;

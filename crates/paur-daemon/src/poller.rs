@@ -37,9 +37,34 @@ pub async fn run(state: AppState) {
 /// enqueues a build if the ref differs from what we last saw.
 async fn poll_once(state: &AppState) -> Result<(), paur_core::Error> {
     let pkgs = state.db.list_packages().await?;
+    // Snapshot the set of packages with a live (queued/running) build
+    // once, so a slow poll loop doesn't enqueue more duplicates than
+    // a single package can drain.
+    let live_pids: std::collections::HashSet<i64> = {
+        let mut live = std::collections::HashSet::new();
+        for b in state
+            .db
+            .list_builds(None, Some(paur_db::BuildStatus::Queued), 1000)
+            .await?
+        {
+            live.insert(b.package_id);
+        }
+        for b in state
+            .db
+            .list_builds(None, Some(paur_db::BuildStatus::Running), 1000)
+            .await?
+        {
+            live.insert(b.package_id);
+        }
+        live
+    };
     let mut triggered = 0usize;
     for p in pkgs {
         if !p.auto_rebuild {
+            continue;
+        }
+        if live_pids.contains(&p.id) {
+            // Already queued or running; don't pile up duplicates.
             continue;
         }
         let name = match PkgName::new(&p.name) {

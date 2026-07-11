@@ -1,0 +1,25 @@
+[package]
+name = "paur-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal S3-compatible uploader for paur artifacts (PUT/DELETE + SigV4 + exponential backoff retry)"
+
+[dependencies]
+paur-core = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"], default-features = false }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.40", features = ["full", "macros", "rt-multi-thread"] }
+wiremock = "0.6"

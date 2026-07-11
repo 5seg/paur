@@ -79,6 +79,56 @@ pub struct Config {
     /// "Add to pacman.conf" hint.
     #[serde(default = "default_public_base_url")]
     pub public_base_url: String,
+
+    /// Optional S3-compatible backend for publishing artifacts. When
+    /// `Some`, `paur-repo` uploads each `.pkg.tar.zst`, the signed
+    /// `paur.db.tar.gz`, and `.sig` files to S3 in addition to (or
+    /// instead of, see `local_repo`) keeping the local copy. Caddy
+    /// (or CloudFront/R2 public URL) serves the objects directly.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+
+    /// When `true` (default), keep the local copy in `repo_dir` even
+    /// when S3 is configured. Set to `false` to publish to S3 only
+    /// and skip the local `repo_dir` writes (saves disk).
+    #[serde(default = "default_true")]
+    pub local_repo: bool,
+}
+
+/// S3-compatible object storage configuration. Any provider that
+/// implements the S3 API works (AWS S3, Cloudflare R2, Backblaze B2,
+/// MinIO, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// Bucket name (e.g. "paur-repo").
+    pub bucket: String,
+    /// S3 endpoint URL. For R2 this is
+    /// `https://<accountid>.r2.cloudflarestorage.com`. For AWS S3
+    /// leave empty to use the regional default.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Region (e.g. "auto" for R2, "us-east-1" for AWS).
+    pub region: String,
+    /// Optional key prefix inside the bucket (e.g. "paur/").
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Access key id. Use a per-bucket scoped key where possible.
+    pub access_key: String,
+    /// Secret access key. Treat like a password.
+    pub secret_key: String,
+    /// Force path-style addressing. Required for MinIO and some R2
+    /// setups; AWS S3 uses virtual-hosted by default.
+    #[serde(default)]
+    pub path_style: bool,
+    /// Optional public URL prefix clients use to fetch objects. When
+    /// set, the daemon logs a hint to set `Server = <public_url>` in
+    /// pacman.conf. Example: `https://pub-xxx.r2.dev`.
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Where the daemon exposes its HTTP API.
@@ -115,6 +165,8 @@ impl Config {
             poll_interval_secs: default_poll_interval(),
             listen: default_listen(),
             public_base_url: default_public_base_url(),
+            s3: None,
+            local_repo: true,
         }
     }
 }

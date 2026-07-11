@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use paur_core::{Config, ContainerRuntime, PkgName};
+use paur_core::{ContainerRuntime, PackageBuildFlags, PkgName};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -40,6 +40,12 @@ pub struct BuildRequest {
     pub runtime: ContainerRuntime,
     /// Container image name (default: `paur-builder:latest`).
     pub image: String,
+    /// Per-package build tuning flags. Applied as:
+    /// - `low_memory`             → `MAKEFLAGS=-j2`
+    /// - `rust_codegen_units_1`   → appends `-C codegen-units=1` to `RUSTFLAGS`
+    /// - `no_ccache`              → skips the ccache bind mount
+    /// Empty flags are a no-op (use the daemon default).
+    pub flags: PackageBuildFlags,
 }
 
 /// What the build produced.
@@ -104,11 +110,17 @@ pub async fn run_in_container(
         req.work_dir.join("out"),
         std::fs::Permissions::from_mode(0o777),
     )?;
-    std::fs::create_dir_all(&req.ccache_dir)?;
-    std::fs::set_permissions(
-        &req.ccache_dir,
-        std::fs::Permissions::from_mode(0o777),
-    )?;
+    // ccache dir is only needed when the build is allowed to use it.
+    // For `no_ccache` packages, we still create the dir on the host
+    // (so the daemon's directory layout stays predictable) but skip
+    // the bind mount + CCACHE_DIR env below.
+    if !req.flags.no_ccache {
+        std::fs::create_dir_all(&req.ccache_dir)?;
+        std::fs::set_permissions(
+            &req.ccache_dir,
+            std::fs::Permissions::from_mode(0o777),
+        )?;
+    }
 
     // Build the docker/podman command line. Keep it short and
     // explicit; do not introduce configuration knobs until a use case
@@ -117,14 +129,28 @@ pub async fn run_in_container(
     let mut cmd = Command::new(bin);
     cmd.args(["run", "--rm"])
         .arg("-v")
-        .arg(format!("{}:/work", req.work_dir.display()))
-        .arg("-v")
-        .arg(format!("{}:/ccache", req.ccache_dir.display()))
-        .arg("-e")
-        .arg("CCACHE_DIR=/ccache")
-        // `makepkg` writes to /etc/makepkg.conf which lives in the
-        // image; we don't override it.
-        .arg(&req.image)
+        .arg(format!("{}:/work", req.work_dir.display()));
+    if !req.flags.no_ccache {
+        cmd.arg("-v")
+            .arg(format!("{}:/ccache", req.ccache_dir.display()))
+            .arg("-e")
+            .arg("CCACHE_DIR=/ccache");
+    }
+    if req.flags.low_memory {
+        // Cap parallel make jobs to cut peak RAM. -j2 is conservative
+        // enough to avoid OOM on the smallest hosts while still
+        // parallelizing the long-running link step.
+        cmd.arg("-e").arg("MAKEFLAGS=-j2");
+    }
+    if req.flags.rust_codegen_units_1 {
+        // Append to whatever RUSTFLAGS the PKGBUILD may have set;
+        // rustc takes the *last* -C codegen-units=1 win, so the
+        // package-level setting still wins. We do this via a shell
+        // expansion in build.sh instead of the container env, so
+        // the inner makepkg can re-export RUSTFLAGS as needed.
+        cmd.arg("-e").arg("PAUR_RUST_CGU=1");
+    }
+    cmd.arg(&req.image)
         .arg(req.pkg.as_str())
         .arg(&req.aur_url)
         .stdin(Stdio::null())
@@ -225,19 +251,131 @@ fn list_artifacts(out_dir: &Path) -> paur_core::Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
-/// Build a `BuildRequest` for a package, given the daemon's [`Config`].
-/// Caller is responsible for the work_dir existing and being unique.
-pub fn request_for(cfg: &Config, pkg: &PkgName, build_id: i64) -> BuildRequest {
-    let aur_url = paur_aur::aur_url(pkg);
-    let work_dir = cfg.work_dir.join(build_id.to_string());
-    BuildRequest {
-        pkg: pkg.clone(),
-        aur_url,
-        work_dir,
-        ccache_dir: cfg.ccache_dir.clone(),
-        runtime: cfg.container_runtime,
-        image: cfg.builder_image.clone(),
+/// What to ask the container to do to the repo DB. We split the
+/// repo-update flow in two so the GPG private key can stay on the
+/// host: the container just runs `repo-add` / `repo-remove` and the
+/// daemon signs the result.
+#[derive(Debug, Clone)]
+pub struct RepoOpRequest {
+    /// What to do.
+    pub op: RepoOp,
+    /// Bind-mounted architecture-specific repo directory
+    /// (e.g. `/var/lib/paur/repo/x86_64`).
+    pub repo_dir: PathBuf,
+    /// Bind-mounted staging directory containing the .pkg.tar.*
+    /// files to register. Required for `Add`, ignored otherwise.
+    pub stage_dir: PathBuf,
+    /// Repo DB basename (e.g. `paur.db.tar.gz`).
+    pub db_name: String,
+    /// For `Add`: package file names (relative to `stage_dir`).
+    /// For `Remove`: the package name registered in the DB.
+    pub names: Vec<String>,
+    /// Container runtime to invoke.
+    pub runtime: ContainerRuntime,
+    /// Container image (defaults to `paur-builder:latest`).
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoOp {
+    /// `repo-add` — register the listed packages into the DB.
+    Add,
+    /// `repo-remove` — drop the named package from the DB.
+    Remove,
+}
+
+impl RepoOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            RepoOp::Add => "repo",
+            RepoOp::Remove => "unrepo",
+        }
     }
+}
+
+/// Run a repo DB update inside the builder container. The container
+/// only sees the repo dir and the staging dir; the GPG keyring stays
+/// on the host. Returns the container's exit code (0 = success).
+pub async fn run_repo_op(req: &RepoOpRequest) -> paur_core::Result<i32> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(&req.repo_dir)?;
+    std::fs::set_permissions(&req.repo_dir, std::fs::Permissions::from_mode(0o777))?;
+    std::fs::create_dir_all(&req.stage_dir)?;
+    std::fs::set_permissions(
+        &req.stage_dir,
+        std::fs::Permissions::from_mode(0o777),
+    )?;
+
+    let bin = req.runtime.binary();
+    let mut cmd = Command::new(bin);
+    cmd.args(["run", "--rm"])
+        .arg("-v")
+        .arg(format!("{}:/work/repo", req.repo_dir.display()))
+        .arg("-v")
+        .arg(format!("{}:/work/stage", req.stage_dir.display()))
+        .arg(&req.image)
+        .arg(req.op.as_str())
+        .arg(&req.db_name);
+    for n in &req.names {
+        // repo-add takes paths; repo-remove takes a bare name. We
+        // pass the same value either way and let the script sort it
+        // out (the script distinguishes via $#).
+        let v = if req.op == RepoOp::Add {
+            format!("/work/stage/{n}")
+        } else {
+            n.clone()
+        };
+        cmd.arg(v);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    tracing::info!(
+        runtime = bin,
+        image = %req.image,
+        op = req.op.as_str(),
+        repo_dir = %req.repo_dir.display(),
+        stage_dir = %req.stage_dir.display(),
+        "spawning repo-op container"
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        paur_core::Error::Repo(format!("failed to spawn {bin} run: {e}"))
+    })?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        paur_core::Error::Repo("child stdout not captured".into())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        paur_core::Error::Repo("child stderr not captured".into())
+    })?;
+    let out_task = tokio::spawn(async move {
+        let mut r = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            tracing::info!(target: "repo_op", "{line}");
+        }
+    });
+    let err_task = tokio::spawn(async move {
+        let mut r = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            tracing::warn!(target: "repo_op", "{line}");
+        }
+    });
+
+    let status = child.wait().await.map_err(|e| {
+        paur_core::Error::Repo(format!("waiting on {bin} run: {e}"))
+    })?;
+    let _ = out_task.await;
+    let _ = err_task.await;
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        return Err(paur_core::Error::Repo(format!(
+            "repo-op container exited {exit_code}"
+        )));
+    }
+    Ok(exit_code)
 }
 
 /// What to build from a *local* PKGBUILD directory. Used by

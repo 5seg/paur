@@ -139,6 +139,29 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Other("missing build_id in response".into()))
     }
 
+    /// `PATCH /api/v1/packages/:name/flags` — set per-package build
+    /// tuning flags. `flags` is serialized as JSON; any field set to
+    /// `true` becomes active on the next build, and the daemon
+    /// composes with the existing flags (existing `true` fields are
+    /// not cleared by a PATCH).
+    pub async fn set_build_flags(
+        &self,
+        name: &str,
+        flags: &paur_core::PackageBuildFlags,
+    ) -> Result<PackageDto, ClientError> {
+        let url = format!("{}/api/v1/packages/{}/flags", self.base, name);
+        let body = serde_json::to_string(flags)
+            .map_err(|e| ClientError::Other(format!("serialize flags: {e}")))?;
+        let resp = self
+            .http
+            .patch(&url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
     /// `GET /api/v1/builds` — list recent builds.
     pub async fn list_builds(
         &self,
@@ -237,6 +260,10 @@ pub struct PackageDto {
     pub last_known_ref: Option<String>,
     pub auto_rebuild: bool,
     pub latest_build: Option<LatestBuildDto>,
+    /// Per-package build tuning flags. Defaults to all-false when
+    /// the daemon predates the flags migration.
+    #[serde(default)]
+    pub build_flags: paur_core::PackageBuildFlags,
 }
 
 /// Latest-build summary embedded in a package.

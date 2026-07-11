@@ -6,6 +6,7 @@ members = [
     "crates/paur-aur",
     "crates/paur-builder",
     "crates/paur-repo",
+    "crates/paur-s3",
     "crates/paur-daemon",
     "crates/paur-cli",
 ]
@@ -52,12 +53,16 @@ walkdir = "2"
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
+# Auth
+bcrypt = "0.15"
+rand = "0.8"
 
 # Internal
 paur-core = { path = "crates/paur-core" }
 paur-aur = { path = "crates/paur-aur" }
 paur-builder = { path = "crates/paur-builder" }
 paur-repo = { path = "crates/paur-repo" }
+paur-s3 = { path = "crates/paur-s3" }
 paur-db = { path = "crates/paur-db" }
 paur-daemon = { path = "crates/paur-daemon" }
 

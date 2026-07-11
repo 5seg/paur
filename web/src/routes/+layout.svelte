@@ -1,8 +1,16 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/stores';
+  import { authState, refreshAuth, logout } from '$lib/auth';
+  import { onMount } from 'svelte';
 
   let { children } = $props();
+
+  onMount(refreshAuth);
+
+  async function doLogout() {
+    await logout();
+  }
 </script>
 
 <div class="min-h-screen flex flex-col">
@@ -24,7 +32,16 @@
           </a>
         {/each}
       </nav>
-      <div class="ml-auto text-xs text-gray-500">personal AUR pre-build</div>
+      <div class="ml-auto flex items-center gap-3 text-xs">
+        {#if $authState.ready}
+          {#if $authState.authenticated}
+            <span class="text-gray-500">admin</span>
+            <button class="btn" onclick={doLogout}>Sign out</button>
+          {:else}
+            <a class="btn btn-primary" href="/login">Sign in</a>
+          {/if}
+        {/if}
+      </div>
     </div>
   </header>
 

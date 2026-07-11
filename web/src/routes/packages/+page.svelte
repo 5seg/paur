@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, fmtTs, type Package } from '$lib/api';
+  import { goto } from '$app/navigation';
+  import { api, ApiError, fmtTs, type Package } from '$lib/api';
+  import { authState } from '$lib/auth';
 
   let pkgs = $state<Package[]>([]);
   let error = $state<string | null>(null);
@@ -22,6 +24,16 @@
     }
   }
 
+  /// If a write call returns 401 the session is gone or never existed.
+  /// Bounce the user to the login page so they can re-auth.
+  function maybeRedirectToLogin(e: unknown) {
+    if (e instanceof ApiError && e.status === 401) {
+      goto('/login');
+      return true;
+    }
+    return false;
+  }
+
   async function submit(e: Event) {
     e.preventDefault();
     if (!newName.trim()) return;
@@ -33,7 +45,9 @@
       newAutoRebuild = false;
       await refresh();
     } catch (err) {
-      submitError = err instanceof Error ? err.message : String(err);
+      if (!maybeRedirectToLogin(err)) {
+        submitError = err instanceof Error ? err.message : String(err);
+      }
     } finally {
       submitting = false;
     }
@@ -44,7 +58,9 @@
       await api.rebuildPackage(name);
       await refresh();
     } catch (e) {
-      alert(`rebuild failed: ${e}`);
+      if (!maybeRedirectToLogin(e)) {
+        alert(`rebuild failed: ${e}`);
+      }
     }
   }
 
@@ -54,7 +70,9 @@
       await api.removePackage(name);
       await refresh();
     } catch (e) {
-      alert(`remove failed: ${e}`);
+      if (!maybeRedirectToLogin(e)) {
+        alert(`remove failed: ${e}`);
+      }
     }
   }
 
@@ -63,32 +81,38 @@
 
 <h1 class="text-2xl font-semibold mb-6">Packages</h1>
 
-<form
-  onsubmit={submit}
-  class="mb-6 flex flex-wrap items-end gap-3 rounded-md border border-gray-200 bg-white p-4"
->
-  <label class="block">
-    <span class="text-xs font-medium text-gray-700">AUR package name</span>
-    <input
-      type="text"
-      bind:value={newName}
-      placeholder="paru-bin"
-      class="mt-1 block w-64 rounded-md border border-gray-300 px-2 py-1.5 text-sm"
-      required
-      pattern="[a-z0-9][a-z0-9._+-]*"
-    />
-  </label>
-  <label class="inline-flex items-center gap-2 text-sm text-gray-700">
-    <input type="checkbox" bind:checked={newAutoRebuild} class="rounded" />
-    auto-rebuild on AUR HEAD change
-  </label>
-  <button class="btn btn-primary" type="submit" disabled={submitting}>
-    {submitting ? 'Adding…' : 'Add + build'}
-  </button>
-  {#if submitError}
-    <span class="text-sm text-red-700">{submitError}</span>
-  {/if}
-</form>
+{#if $authState.authenticated}
+  <form
+    onsubmit={submit}
+    class="mb-6 flex flex-wrap items-end gap-3 rounded-md border border-gray-200 bg-white p-4"
+  >
+    <label class="block">
+      <span class="text-xs font-medium text-gray-700">AUR package name</span>
+      <input
+        type="text"
+        bind:value={newName}
+        placeholder="paru-bin"
+        class="mt-1 block w-64 rounded-md border border-gray-300 px-2 py-1.5 text-sm"
+        required
+        pattern="[a-z0-9][a-z0-9._+-]*"
+      />
+    </label>
+    <label class="inline-flex items-center gap-2 text-sm text-gray-700">
+      <input type="checkbox" bind:checked={newAutoRebuild} class="rounded" />
+      auto-rebuild on AUR HEAD change
+    </label>
+    <button class="btn btn-primary" type="submit" disabled={submitting}>
+      {submitting ? 'Adding…' : 'Add + build'}
+    </button>
+    {#if submitError}
+      <span class="text-sm text-red-700">{submitError}</span>
+    {/if}
+  </form>
+{:else if $authState.ready}
+  <div class="mb-6 rounded-md border border-gray-200 bg-white p-4 text-sm text-gray-700">
+    Sign in to add, rebuild, or remove packages. <a class="text-blue-700 hover:underline" href="/login">Sign in</a>
+  </div>
+{/if}
 
 {#if error}
   <div class="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800 mb-4">
@@ -131,8 +155,10 @@
             <td>{p.latest_build?.pkg_version ?? '-'}</td>
             <td>{fmtTs(p.latest_build?.finished_at)}</td>
             <td class="space-x-1 text-right">
-              <button class="btn" onclick={() => rebuild(p.name)}>Rebuild</button>
-              <button class="btn btn-danger" onclick={() => remove(p.name)}>Remove</button>
+              {#if $authState.authenticated}
+                <button class="btn" onclick={() => rebuild(p.name)}>Rebuild</button>
+                <button class="btn btn-danger" onclick={() => remove(p.name)}>Remove</button>
+              {/if}
             </td>
           </tr>
         {/each}

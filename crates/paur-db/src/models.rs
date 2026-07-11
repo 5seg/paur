@@ -113,6 +113,11 @@ pub struct Package {
     pub added_at: i64,
     pub enabled: bool,
     pub auto_rebuild: bool,
+    /// Per-package build tuning (memory/CPU). JSON blob from
+    /// `PackageBuildFlags`. Defaults to all-false when the column
+    /// is empty (older rows from before migration 0004).
+    #[serde(default)]
+    pub build_flags: paur_core::PackageBuildFlags,
 }
 
 /// A row of the `builds` table.
@@ -120,6 +125,10 @@ pub struct Package {
 pub struct Build {
     pub id: i64,
     pub package_id: i64,
+    /// 1-based per-package sequence number: #1 is the first build for
+    /// this package, #2 the next, etc. Stable for the lifetime of a
+    /// row; the global `id` is still the canonical primary key.
+    pub seq: i64,
     pub status: BuildStatus,
     pub queued_at: i64,
     pub started_at: Option<i64>,

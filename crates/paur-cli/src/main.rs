@@ -70,6 +70,25 @@ enum Cmd {
         /// Package name.
         name: String,
     },
+    /// Read or update per-package build tuning flags (memory/CPU
+    /// countermeasures for OOM-prone packages). With no flags, prints
+    /// the current values.
+    Flag {
+        /// Package name.
+        name: String,
+        /// Show current flags without modifying them.
+        #[arg(long)]
+        list: bool,
+        /// Cap parallel make jobs to `-j2` to cut peak RAM.
+        #[arg(long, value_parser = parse_on_off)]
+        low_memory: Option<bool>,
+        /// Append `-C codegen-units=1` to `RUSTFLAGS` for Rust builds.
+        #[arg(long, value_parser = parse_on_off)]
+        rust_codegen_units_1: Option<bool>,
+        /// Skip ccache bind mount for this package.
+        #[arg(long, value_parser = parse_on_off)]
+        no_ccache: Option<bool>,
+    },
     /// Show the current queue and running builds.
     Queue,
     /// Print the GPG public key the repo is signed with.
@@ -169,6 +188,16 @@ async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
             let c = client(&cfg, cli.api.as_deref());
             cmd::rebuild(&c, &name).await
         }
+        Cmd::Flag {
+            name,
+            list,
+            low_memory,
+            rust_codegen_units_1,
+            no_ccache,
+        } => {
+            let c = client(&cfg, cli.api.as_deref());
+            cmd::flag(&c, &name, list, low_memory, rust_codegen_units_1, no_ccache).await
+        }
         Cmd::Queue => {
             let c = client(&cfg, cli.api.as_deref());
             cmd::queue(&c).await
@@ -223,6 +252,18 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("paur_cli=info"));
     let _ = fmt().with_env_filter(filter).try_init();
+}
+
+/// Parse `on`/`off`/`true`/`false`/`1`/`0` for boolean flags. Case
+/// insensitive. Errors are user-visible so clap prints them.
+fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        other => Err(format!(
+            "expected on/off (got {other:?}); use --list to view current values"
+        )),
+    }
 }
 
 /// Tiny facade that re-exports the daemon's `serve` entry points under

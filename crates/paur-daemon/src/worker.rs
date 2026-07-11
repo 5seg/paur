@@ -22,17 +22,35 @@ pub struct AppState {
     pub repo: Arc<RepoCtx>,
     /// Per-build broadcast channels for log fan-out. Keyed by build id.
     pub log_channels: Arc<Mutex<std::collections::HashMap<i64, broadcast::Sender<String>>>>,
+    /// Wakeup sender. The HTTP API pings this whenever it enqueues
+    /// a new build so the worker picks it up without waiting for
+    /// the next AUR poll cycle. The worker installs a real sender
+    /// during [`run`]; before that, it's `None` and `send_wake` is
+    /// a no-op.
+    pub wake: Arc<Mutex<Option<tokio::sync::mpsc::Sender<i64>>>>,
 }
 
 impl AppState {
     /// Create a fresh state. The `log_channels` map starts empty; the
-    /// worker creates a channel on the first build claim.
+    /// worker creates a channel on the first build claim. The wake
+    /// sender is installed later by [`run`].
     pub fn new(db: paur_db::Db, cfg: paur_core::Config, repo: RepoCtx) -> Self {
         Self {
             db,
             cfg,
             repo: Arc::new(repo),
             log_channels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            wake: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Ping the worker to wake up and pick up newly enqueued builds.
+    /// Best-effort: if no worker is running yet (e.g. during very
+    /// early startup) the send is silently dropped — the start-up
+    /// scanner in [`run`] will pick the row up anyway.
+    pub async fn send_wake(&self, build_id: i64) {
+        if let Some(tx) = self.wake.lock().await.as_ref() {
+            let _ = tx.send(build_id).await;
         }
     }
 
@@ -76,7 +94,26 @@ pub async fn run(state: AppState, max_workers: u32) -> Result<(), paur_core::Err
         tracing::warn!(reaped = n, "reaped stale running builds from previous run");
     }
 
+    // The worker reads build ids off `rx`. Two sources can put ids
+    // there: the HTTP API (which sends into `state.wake`) and the
+    // one-shot kicker that scans the DB on startup. We bridge both
+    // into a single `tx` so the worker logic stays simple.
     let (tx, rx) = tokio::sync::mpsc::channel::<i64>(32);
+
+    // Forwarder: API wakes -> worker's `tx`. The forwarder owns the
+    // receiver half of the API's wake channel; the sender half is
+    // stored in `state.wake` (an `Arc<Mutex<Option<Sender>>>`) and
+    // used by the HTTP handlers.
+    {
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::channel::<i64>(32);
+        *state.wake.lock().await = Some(api_tx);
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            while let Some(id) = api_rx.recv().await {
+                let _ = tx2.send(id).await;
+            }
+        });
+    }
     // On startup, enqueue any already-queued rows so the worker
     // picks them up.
     {
@@ -94,7 +131,7 @@ pub async fn run(state: AppState, max_workers: u32) -> Result<(), paur_core::Err
             }
         });
     }
-    // Drop the kicker's sender; the worker holds the only other.
+    // Both upstream senders have been moved into their tasks.
     drop(tx);
 
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
@@ -120,17 +157,22 @@ async fn run_worker(state: AppState, rx: Arc<Mutex<tokio::sync::mpsc::Receiver<i
 
 /// Process a single build id end-to-end: claim -> build -> publish.
 async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::Error> {
-    // Claim and load the package.
-    let claimed = state.db.claim_next_queued("paur-worker").await?;
-    let Some(build) = claimed else {
-        // Already claimed by someone else; nothing to do.
-        return Ok(());
+    // Claim the build we were woken for. The wake payload is the
+    // authoritative request (poller knows which AUR ref changed, API
+    // knows which package was just enqueued), so we honor it instead
+    // of falling back to "oldest queued". If the row is missing or
+    // not in `queued` state (e.g. it was already running, finished,
+    // or stale-claimed by a previous incarnation), skip silently.
+    let build = match state.db.claim_build_by_id(build_id, "paur-worker").await? {
+        Some(b) => b,
+        None => {
+            tracing::debug!(
+                build_id,
+                "wake: build not in queued state; nothing to do"
+            );
+            return Ok(());
+        }
     };
-    if build.id != build_id {
-        // We were given a specific id but the queue had a different
-        // one ready; let the dispatcher move on.
-        return Ok(());
-    }
     let pkg = state
         .db
         .list_packages()
@@ -156,6 +198,7 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
         ccache_dir: state.cfg.ccache_dir.clone(),
         runtime: state.cfg.container_runtime,
         image: state.cfg.builder_image.clone(),
+        flags: pkg.build_flags.clone(),
     };
     let outcome = paur_builder::run_in_container(&req, Arc::clone(&sink)).await?;
 
@@ -192,13 +235,15 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
                         .await
                         .ok();
                 }
-                // Track the new AUR ref so the poller can detect
-                // upstream changes.
-                if let Some(si) = outcome.srcinfo.as_ref() {
-                    let _ = state
-                        .db
-                        .set_last_ref(pkg.id, &format!("{}:{}", pkg_name, si.full_version().unwrap_or_default()))
-                        .await;
+                // Track the new AUR HEAD so the poller can detect
+                // upstream changes on the next tick. We resolve the
+                // ref here (not at queue time) so the recorded value
+                // is the one that produced this build. A failure
+                // here is non-fatal: the poller will just re-enqueue
+                // until it can record a ref, but the build itself is
+                // already published.
+                if let Ok(head) = paur_aur::latest_ref(&pkg_name).await {
+                    let _ = state.db.set_last_ref(pkg.id, &head).await;
                 }
             }
             Err(e) => {
@@ -211,6 +256,21 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
     }
 
     state.drop_channel(build.id).await;
+    // Free the per-build work directory. We always do this — the
+    // .pkg.tar.* files have already been copied into the repo by
+    // publish_artifacts (when applicable), and the rest (AUR git
+    // clone, downloaded sources, makepkg's pkg/src trees) is
+    // throwaway state we don't want to keep. Failure to clean up is
+    // logged but not fatal: the build itself is already recorded.
+    if let Err(e) = std::fs::remove_dir_all(&req.work_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                build_id,
+                work_dir = %req.work_dir.display(),
+                "failed to remove work dir: {e}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -258,14 +318,20 @@ impl DbLogSink {
 #[async_trait]
 impl LogSink for DbLogSink {
     async fn write(&self, line: &str) -> Result<(), paur_core::Error> {
+        // axum's SSE layer rejects values containing \r or \n. The
+        // builder hands us one line per call so this should be rare,
+        // but a stray embedded \r from `makepkg`'s carriage-return
+        // progress output will panic the response task. Strip
+        // CR/LF defensively before fanning out.
+        let safe = line.replace(['\r', '\n'], "");
         // Persist.
         self.state
             .db
-            .append_log(self.build_id, Stream::Stdout, line)
+            .append_log(self.build_id, Stream::Stdout, &safe)
             .await?;
         // Fan out to any subscribers (best effort).
         let tx = self.state.channel_for(self.build_id).await;
-        let _ = tx.send(line.to_string());
+        let _ = tx.send(safe);
         // Sequence counter is informational; we keep our own log line
         // count here purely so tests can confirm ordering.
         let _ = self

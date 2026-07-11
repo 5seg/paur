@@ -73,7 +73,9 @@
 
 <div class="mb-4 flex items-center gap-3">
   <a class="text-sm text-blue-700 hover:underline" href="/queue">← back</a>
-  <h1 class="text-2xl font-semibold">Build #{id}</h1>
+  <h1 class="text-2xl font-semibold">
+    {#if build}build #{build.seq}{:else}Build #{id}{/if}
+  </h1>
   {#if build}
     <span class={`badge badge-${build.status}`}>{build.status}</span>
     <span class="text-sm text-gray-500">trigger: {build.trigger}</span>

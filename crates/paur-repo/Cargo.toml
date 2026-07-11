@@ -7,7 +7,10 @@ license.workspace = true
 description = "pacman repo + GPG signing for paur"
 
 [dependencies]
+async-trait = { workspace = true }
+paur-builder = { workspace = true }
 paur-core = { workspace = true }
+paur-s3 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

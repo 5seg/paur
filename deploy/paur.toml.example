@@ -58,3 +58,39 @@ data_dir = "/var/lib/paur"
 # The URL the repo is served at, used in `paur print-pacman-conf` and
 # in the UI's pacman.conf hint.
 # public_base_url = "https://paur.example"
+
+# Whether to keep the local repo copy in `repo_dir` when S3 is
+# configured. Default: true. Set to false to publish to S3 only.
+# local_repo = true
+
+# ----------------------------------------------------------------------------
+# S3-compatible object storage (optional)
+# ----------------------------------------------------------------------------
+# When `[s3]` is set, every successful build uploads its `.pkg.tar.zst`,
+# `.sig`, and the regenerated `paur.db.tar.gz` (with its `.sig`) to the
+# configured bucket. The local copy in `repo_dir` is kept unless
+# `local_repo = false`.
+#
+# The signer (GPG) still runs on the host — only artifact storage moves
+# to S3. The bucket is expected to be reachable from the build host
+# (private network, VPC endpoint, etc.).
+#
+# Works with AWS S3, Cloudflare R2, Backblaze B2, MinIO, and any other
+# S3-compatible store. The same retry policy as the rest of paur
+# (1s, 2s, 5s, 15s with ±30% jitter) is used on transient 5xx / network
+# errors; 4xx responses fail fast.
+#
+# [s3]
+# bucket = "paur-repo"
+# region = "auto"                                 # "auto" for R2
+# endpoint = "https://<accountid>.r2.cloudflarestorage.com"  # R2/MinIO only
+# path_style = true                               # required for R2/MinIO
+# prefix = "paur/"                                # optional key prefix
+# access_key = "<access-key-id>"
+# secret_key = "<secret-access-key>"
+#
+# # Optional: where clients fetch artifacts from. When set, the daemon
+# # logs it as a pacman.conf hint. Must serve the same keys the daemon
+# # writes (so a CloudFront/R2 public bucket or a Caddy reverse-proxy
+# # in front of S3). Example: "https://paur.example/repo".
+# public_url = "https://paur.example/repo"

@@ -15,29 +15,34 @@ use axum::response::{
     sse::{Event, KeepAlive, Sse},
     IntoResponse, Response,
 };
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures::stream::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::auth::{self, Admin};
 use crate::worker::AppState;
 
 /// Build the [`Router`] for the API. Caller is responsible for
 /// `serve`-ing it onto the appropriate listener.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/packages", get(list_packages).post(add_package))
         .route("/api/v1/packages/:name", get(get_package).delete(delete_package))
         .route("/api/v1/packages/:name/rebuild", post(rebuild_package))
+        .route("/api/v1/packages/:name/auto", patch(set_package_auto))
+        .route("/api/v1/packages/:name/flags", patch(set_package_flags))
         .route("/api/v1/builds", get(list_builds))
         .route("/api/v1/builds/:id", get(get_build))
         .route("/api/v1/builds/:id/logs", get(stream_logs))
         .route("/api/v1/builds/:id/logs.txt", get(raw_logs))
         .route("/api/v1/queue", get(queue))
         .route("/api/v1/pubkey", get(pubkey))
-        .with_state(Arc::new(state))
+        .route("/api/v1/repo/:arch/*file", get(serve_repo_file))
+        .merge(auth::router());
+    api.with_state(Arc::new(state))
 }
 
 /// Serve the API on the configured listener. Returns when the listener
@@ -73,8 +78,16 @@ struct ApiError(paur_core::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let status = match &self.0 {
+            paur_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            paur_core::Error::Invalid(_) | paur_core::Error::InvalidName(..) => {
+                StatusCode::BAD_REQUEST
+            }
+            paur_core::Error::MissingDep(_) => StatusCode::NOT_IMPLEMENTED,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         let body = serde_json::json!({ "error": self.0.to_string() });
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        (status, Json(body)).into_response()
     }
 }
 
@@ -100,11 +113,47 @@ struct PackageDto {
     last_known_ref: Option<String>,
     auto_rebuild: bool,
     latest_build: Option<LatestBuildDto>,
+    /// Per-package build tuning flags (memory/CPU OOM countermeasures).
+    /// Defaults to all-false for clients that predate the field.
+    #[serde(default)]
+    build_flags: paur_core::PackageBuildFlags,
+}
+
+impl PackageDto {
+    /// Build a `PackageDto` from a `Package` + its latest build. Used
+    /// by every read/write endpoint that returns package data so the
+    /// serialization shape stays consistent.
+    async fn from_pkg(
+        db: &paur_db::Db,
+        pkg: paur_db::Package,
+    ) -> Result<Self, paur_core::Error> {
+        let latest = db.latest_build_for(pkg.id).await?;
+        Ok(Self {
+            id: pkg.id,
+            name: pkg.name,
+            aur_url: pkg.aur_url,
+            last_known_ref: pkg.last_known_ref,
+            auto_rebuild: pkg.auto_rebuild,
+            latest_build: latest.map(|b| LatestBuildDto {
+                id: b.id,
+                seq: b.seq,
+                status: b.status.as_str().to_string(),
+                pkg_version: b.pkg_version,
+                finished_at: b.finished_at,
+                exit_code: b.exit_code,
+            }),
+            build_flags: pkg.build_flags,
+        })
+    }
 }
 
 #[derive(Serialize)]
 struct LatestBuildDto {
     id: i64,
+    /// Per-package sequence number (1-based). Use this for the
+    /// human-friendly "build #N" label; `id` is the global primary
+    /// key and is what other resources (logs, repo) key on.
+    seq: i64,
     status: String,
     pkg_version: Option<String>,
     finished_at: Option<i64>,
@@ -117,21 +166,7 @@ async fn list_packages(
     let pkgs = state.db.list_packages().await?;
     let mut out = Vec::with_capacity(pkgs.len());
     for p in pkgs {
-        let latest = state.db.latest_build_for(p.id).await?;
-        out.push(PackageDto {
-            id: p.id,
-            name: p.name,
-            aur_url: p.aur_url,
-            last_known_ref: p.last_known_ref,
-            auto_rebuild: p.auto_rebuild,
-            latest_build: latest.map(|b| LatestBuildDto {
-                id: b.id,
-                status: b.status.as_str().to_string(),
-                pkg_version: b.pkg_version,
-                finished_at: b.finished_at,
-                exit_code: b.exit_code,
-            }),
-        });
+        out.push(PackageDto::from_pkg(&state.db, p).await?);
     }
     Ok(Json(out))
 }
@@ -145,6 +180,7 @@ struct AddPackageBody {
 
 async fn add_package(
     State(state): State<Arc<AppState>>,
+    _admin: Admin,
     Json(body): Json<AddPackageBody>,
 ) -> ApiResult<(StatusCode, Json<PackageDto>)> {
     let name = paur_core::PkgName::new(&body.name)
@@ -159,29 +195,15 @@ async fn add_package(
         .enqueue_build(id, paur_db::BuildTrigger::Manual)
         .await?;
     tracing::info!(pkg = %name, build_id, "package enqueued via API");
-    // Wake the worker.
-    if let Some(tx) = state.log_channels.lock().await.get(&build_id).cloned() {
-        // No-op: a wakeup channel is not used today; the worker pulls
-        // on its own mpsc. Reserved for future push-based wake.
-        drop(tx);
-    }
+    // Wake the worker so it picks the new build up immediately.
+    state.send_wake(build_id).await;
     // We synthesize a minimal dto from what we just wrote.
     let pkg = state
         .db
         .get_package_by_name(name.as_str())
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound("package vanished".into())))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(PackageDto {
-            id: pkg.id,
-            name: pkg.name,
-            aur_url: pkg.aur_url,
-            last_known_ref: pkg.last_known_ref,
-            auto_rebuild: pkg.auto_rebuild,
-            latest_build: None,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(PackageDto::from_pkg(&state.db, pkg).await?)))
 }
 
 async fn get_package(
@@ -193,25 +215,78 @@ async fn get_package(
         .get_package_by_name(&name)
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
-    let latest = state.db.latest_build_for(p.id).await?;
-    Ok(Json(PackageDto {
-        id: p.id,
-        name: p.name,
-        aur_url: p.aur_url,
-        last_known_ref: p.last_known_ref,
-        auto_rebuild: p.auto_rebuild,
-        latest_build: latest.map(|b| LatestBuildDto {
-            id: b.id,
-            status: b.status.as_str().to_string(),
-            pkg_version: b.pkg_version,
-            finished_at: b.finished_at,
-            exit_code: b.exit_code,
-        }),
-    }))
+    Ok(Json(PackageDto::from_pkg(&state.db, p).await?))
+}
+
+#[derive(Deserialize)]
+struct SetAutoBody {
+    auto_rebuild: bool,
+}
+
+/// Toggle the per-package `auto_rebuild` flag. Admin-only: we
+/// don't want anonymous visitors to flip poller behavior for our
+/// tracked packages.
+async fn set_package_auto(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+    Json(body): Json<SetAutoBody>,
+) -> ApiResult<Json<PackageDto>> {
+    let n = state.db.set_auto_rebuild(&name, body.auto_rebuild).await?;
+    if n == 0 {
+        return Err(ApiError(paur_core::Error::NotFound(name.clone())));
+    }
+    // Return the fresh DTO so the UI can re-render without a
+    // second round-trip.
+    let p = state
+        .db
+        .get_package_by_name(&name)
+        .await?
+        .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
+    Ok(Json(PackageDto::from_pkg(&state.db, p).await?))
+}
+
+/// `PATCH /api/v1/packages/:name/flags` — set per-package build
+/// tuning flags. Admin-only: changing build behavior for tracked
+/// packages should require a deliberate action.
+///
+/// The body is a `PackageBuildFlags` JSON object. The daemon
+/// composes the patch with the existing flags: any field sent as
+/// `true` becomes active, `false` is a no-op (use the dedicated
+/// `DELETE /flags/:key` endpoint to clear individual flags, or
+/// send the desired full state — kept for the next iteration).
+async fn set_package_flags(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+    Json(patch): Json<paur_core::PackageBuildFlags>,
+) -> ApiResult<Json<PackageDto>> {
+    // Read the current flags, merge the patch in, write back. This
+    // is two queries but keeps the contract simple ("any field sent
+    // as true is enabled, anything else is preserved").
+    let cur = state
+        .db
+        .get_package_by_name(&name)
+        .await?
+        .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
+    let mut merged = cur.build_flags.clone();
+    merged.merge_from(&patch);
+    let n = state.db.set_build_flags(&name, &merged).await?;
+    if n == 0 {
+        return Err(ApiError(paur_core::Error::NotFound(name.clone())));
+    }
+    tracing::info!(pkg = %name, ?merged, "build_flags updated via API");
+    let p = state
+        .db
+        .get_package_by_name(&name)
+        .await?
+        .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
+    Ok(Json(PackageDto::from_pkg(&state.db, p).await?))
 }
 
 async fn delete_package(
     State(state): State<Arc<AppState>>,
+    _admin: Admin,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let p = state
@@ -234,6 +309,7 @@ async fn delete_package(
 
 async fn rebuild_package(
     State(state): State<Arc<AppState>>,
+    _admin: Admin,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let p = state
@@ -245,6 +321,7 @@ async fn rebuild_package(
         .db
         .enqueue_build(p.id, paur_db::BuildTrigger::Rebuild)
         .await?;
+    state.send_wake(id).await;
     Ok(Json(serde_json::json!({ "build_id": id })))
 }
 
@@ -384,4 +461,57 @@ async fn pubkey(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
             "pubkey not exported yet; run `paur init`".into(),
         ))),
     }
+}
+
+/// Serve a single file from the arch-specific repo dir. Mounted at
+/// `/api/v1/repo/:arch/*file`; Caddy strips the `/api/v1/repo/:arch/`
+/// prefix and forwards the rest. We resolve the requested path under
+/// `state.repo.arch_dir()` and reject any traversal (`..`).
+async fn serve_repo_file(
+    State(state): State<Arc<AppState>>,
+    Path((arch, file)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    if arch != state.repo.arch {
+        return Err(ApiError(paur_core::Error::NotFound(format!(
+            "unknown arch: {arch}"
+        ))));
+    }
+    // Reject path traversal: the `*file` matcher can capture `..`
+    // segments. Canonicalize after joining and require the result to
+    // live under arch_dir.
+    let base = state.repo.arch_dir();
+    let path = base.join(&file);
+    let canon = match tokio::fs::canonicalize(&path).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(ApiError(paur_core::Error::NotFound(format!(
+                "no such file: {file}"
+            ))));
+        }
+    };
+    let base_canon = tokio::fs::canonicalize(&base)
+        .await
+        .map_err(paur_core::Error::Io)?;
+    if !canon.starts_with(&base_canon) {
+        return Err(ApiError(paur_core::Error::Invalid(
+            "path traversal blocked".into(),
+        )));
+    }
+    let bytes = tokio::fs::read(&canon)
+        .await
+        .map_err(|_| paur_core::Error::NotFound(format!("no such file: {file}")))?;
+    let ct = match canon.extension().and_then(|s| s.to_str()) {
+        Some("sig") => "application/pgp-signature",
+        Some("asc") => "application/pgp-keys",
+        Some("gz") => "application/gzip",
+        _ => "application/octet-stream",
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (axum::http::header::CACHE_CONTROL, "no-cache, must-revalidate"),
+        ],
+        bytes,
+    )
+        .into_response())
 }

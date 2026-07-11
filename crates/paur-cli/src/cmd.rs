@@ -205,6 +205,58 @@ pub async fn rebuild(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// `paur-cli flag <pkg> --list | --low-memory on|off [--rust-codegen-units-1 on|off] [--no-ccache on|off]`
+///
+/// Per-package build tuning flags (memory/CPU countermeasures). The
+/// daemon composes them in a fixed order:
+///
+/// - `low_memory`             → `MAKEFLAGS=-j2`
+/// - `rust_codegen_units_1`   → appends `-C codegen-units=1` to `RUSTFLAGS`
+/// - `no_ccache`              → skips the ccache bind mount
+///
+/// All flags are independent booleans; omitting a flag leaves it
+/// unchanged. `--list` is a read-only path that hits the same
+/// `get_package` endpoint and prints the current state.
+pub async fn flag(
+    client: &DaemonClient,
+    pkg: &str,
+    list: bool,
+    low_memory: Option<bool>,
+    rust_codegen_units_1: Option<bool>,
+    no_ccache: Option<bool>,
+) -> Result<(), CmdError> {
+    let name = PkgName::new(pkg)?;
+    if list
+        || (low_memory.is_none() && rust_codegen_units_1.is_none() && no_ccache.is_none())
+    {
+        let p = client.get_package(name.as_str()).await?;
+        println!("name:                {}", p.name);
+        println!("low_memory:          {}", p.build_flags.low_memory);
+        println!("rust_codegen_units_1: {}", p.build_flags.rust_codegen_units_1);
+        println!("no_ccache:           {}", p.build_flags.no_ccache);
+        return Ok(());
+    }
+
+    // Build the patch. Only fields explicitly set in this invocation
+    // are sent; existing `true` fields are preserved by the daemon.
+    let mut update = paur_core::PackageBuildFlags::default();
+    if let Some(v) = low_memory {
+        update.low_memory = v;
+    }
+    if let Some(v) = rust_codegen_units_1 {
+        update.rust_codegen_units_1 = v;
+    }
+    if let Some(v) = no_ccache {
+        update.no_ccache = v;
+    }
+    let updated = client.set_build_flags(name.as_str(), &update).await?;
+    println!("{} flags updated:", updated.name);
+    println!("  low_memory:           {}", updated.build_flags.low_memory);
+    println!("  rust_codegen_units_1: {}", updated.build_flags.rust_codegen_units_1);
+    println!("  no_ccache:            {}", updated.build_flags.no_ccache);
+    Ok(())
+}
+
 /// `paur-cli pubkey` — fetch and print the GPG pubkey.
 pub async fn pubkey(client: &DaemonClient) -> Result<(), CmdError> {
     let k = client.pubkey().await?;

@@ -4,10 +4,13 @@
 //! 1. The build step finishes with `.pkg.tar.zst` artifacts in a
 //!    per-build `out/` directory.
 //! 2. `publish` copies those artifacts into the architecture-specific
-//!    subdir of the repo, then runs `repo-add` to register them with
-//!    the repo's `<name>.db.tar.gz` (and `<name>.files.tar.gz`).
-//! 3. After the DB is updated, the crate produces detached GPG
-//!    signatures for the DB and for each new `.pkg.tar.zst`.
+//!    subdir of the repo, then asks the builder container to run
+//!    `repo-add` on them (we can't run `repo-add` on the host
+//!    because Debian/Ubuntu don't ship `pacman-contrib`).
+//! 3. After `repo-add` updates `<name>.db.tar.gz`, the daemon
+//!    produces detached GPG signatures for the DB and for each new
+//!    `.pkg.tar.zst` on the host. The signing key never leaves the
+//!    host's GNUPGHOME.
 //!
 //! The signing key is identified by keyid/fingerprint; the calling
 //! code is responsible for the actual GPG key creation (typically at
@@ -16,13 +19,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use paur_core::PkgName;
-
-/// Where to find the GPG keyring, which key to use, and which repo
-/// database files to manage. Cheap to clone.
+use paur_builder::{run_repo_op, RepoOp, RepoOpRequest};
+use paur_core::{ContainerRuntime, PkgName, S3Config};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoCtx {
     /// Path to `<name>.db.tar.gz` (the `*` is implicit; pass without
@@ -36,6 +38,75 @@ pub struct RepoCtx {
     pub gpg_home: PathBuf,
     /// GPG key id / fingerprint to sign with.
     pub gpg_key: String,
+    /// Container runtime used to run `repo-add`/`repo-remove`.
+    pub container_runtime: ContainerRuntime,
+    /// Builder image used to run `repo-add`/`repo-remove`.
+    pub builder_image: String,
+    /// Optional S3 configuration. When `Some`, every publish also
+    /// uploads artifacts to S3. The local copy is kept unless
+    /// `local_repo` is `false` (config-level flag, not in this ctx).
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// Abstracts the host-side work the repo crate needs from the
+/// builder: staging .pkg.tar.* files and asking the container to
+/// run `repo-add` / `repo-remove`. Keeping this behind a trait lets
+/// `publish` / `remove` be unit-tested with a mock implementation.
+#[async_trait]
+pub trait RepoOps: Send + Sync {
+    /// Stage `pkg_files` into a per-publish directory the container
+    /// can read, then ask the container to `repo-add` them.
+    async fn add(&self, ctx: &RepoCtx, db_name: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()>;
+    /// Ask the container to `repo-remove` the named package.
+    async fn remove(&self, ctx: &RepoCtx, db_name: &str, pkgname: &str) -> paur_core::Result<()>;
+}
+
+/// Default implementation: shells out to the builder container.
+pub struct ContainerRepoOps;
+
+#[async_trait]
+impl RepoOps for ContainerRepoOps {
+    async fn add(&self, ctx: &RepoCtx, db_name: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()> {
+        let stage_dir = ctx.repo_dir.join(".stage");
+        std::fs::create_dir_all(&stage_dir)?;
+        let mut names = Vec::with_capacity(pkg_files.len());
+        for src in pkg_files {
+            let name = src.file_name().ok_or_else(|| {
+                paur_core::Error::Repo(format!("artifact has no file name: {}", src.display()))
+            })?;
+            let dst = stage_dir.join(name);
+            std::fs::copy(src, &dst).map_err(|e| {
+                paur_core::Error::Repo(format!("stage {} -> {}: {e}", src.display(), dst.display()))
+            })?;
+            names.push(name.to_string_lossy().into_owned());
+        }
+        let req = RepoOpRequest {
+            op: RepoOp::Add,
+            repo_dir: ctx.arch_dir(),
+            stage_dir,
+            db_name: db_name.to_string(),
+            names,
+            runtime: ctx.container_runtime,
+            image: ctx.builder_image.clone(),
+        };
+        run_repo_op(&req).await?;
+        Ok(())
+    }
+
+    async fn remove(&self, ctx: &RepoCtx, db_name: &str, pkgname: &str) -> paur_core::Result<()> {
+        let req = RepoOpRequest {
+            op: RepoOp::Remove,
+            repo_dir: ctx.arch_dir(),
+            stage_dir: ctx.repo_dir.join(".stage"),
+            db_name: db_name.to_string(),
+            names: vec![pkgname.to_string()],
+            runtime: ctx.container_runtime,
+            image: ctx.builder_image.clone(),
+        };
+        run_repo_op(&req).await?;
+        Ok(())
+    }
 }
 
 impl RepoCtx {
@@ -64,17 +135,34 @@ impl RepoCtx {
         p.push(".sig");
         PathBuf::from(p)
     }
+
+    /// The `<name>.db.tar.gz` basename (used by the builder script).
+    fn db_basename(&self) -> String {
+        format!("{}.db.tar.gz", self.repo_name)
+    }
 }
 
 /// Add `.pkg.tar.zst` files to the repo. Returns the new DB sig path
 /// so callers can confirm signing succeeded.
 pub async fn publish(ctx: &RepoCtx, pkg_files: &[PathBuf]) -> paur_core::Result<PathBuf> {
+    publish_with(ctx, pkg_files, &ContainerRepoOps).await
+}
+
+/// Same as [`publish`] but lets the caller inject a [`RepoOps`].
+/// Test-only in practice.
+pub async fn publish_with(
+    ctx: &RepoCtx,
+    pkg_files: &[PathBuf],
+    ops: &dyn RepoOps,
+) -> paur_core::Result<PathBuf> {
     if pkg_files.is_empty() {
         return Err(paur_core::Error::Build("no .pkg.tar.zst to publish".into()));
     }
     std::fs::create_dir_all(ctx.arch_dir())?;
 
-    // Copy artifacts to the arch dir.
+    // Copy artifacts into the arch dir (so pacman can fetch them
+    // directly from Caddy). repo-add runs in the container; the
+    // script reads the staged copies there.
     let mut staged: Vec<PathBuf> = Vec::new();
     for src in pkg_files {
         let name = src.file_name().ok_or_else(|| {
@@ -87,39 +175,17 @@ pub async fn publish(ctx: &RepoCtx, pkg_files: &[PathBuf]) -> paur_core::Result<
         staged.push(dst);
     }
 
-    // Run repo-add. We pass `<name>.db.tar.gz`; the tool will create
-    // `<name>.db` (and `<name>.files`) alongside it.
-    let db_arg = ctx
-        .db_path_for_repo_add()
-        .to_str()
-        .ok_or_else(|| paur_core::Error::Repo("non-utf8 db path".into()))?
-        .to_string();
-    let mut cmd = Command::new("repo-add");
-    cmd.arg(&db_arg);
-    for s in &staged {
-        cmd.arg(s);
-    }
-    cmd.stdin(Stdio::null());
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| paur_core::Error::Repo(format!("spawn repo-add: {e}")))?;
-    if !out.status.success() {
-        return Err(paur_core::Error::Repo(format!(
-            "repo-add failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
+    // Ask the container to update the DB.
+    ops.add(ctx, &ctx.db_basename(), &staged).await?;
 
-    // Sign the DB and each new package. Old .sig files become stale
-    // (the file contents changed) so we delete them first; the .sig
-    // will be regenerated below.
+    // Re-sign the DB. The container's `repo-add` deletes the
+    // existing .sig (because the DB content changes) so we always
+    // produce a fresh one.
     let db_sig = ctx.db_sig();
     let _ = std::fs::remove_file(&db_sig);
     sign(&ctx.gpg_home, &ctx.gpg_key, &ctx.db_path()).await?;
 
     for pkg in &staged {
-        // Each package has its own .sig alongside it.
         let sig = {
             let mut s = pkg.as_os_str().to_owned();
             s.push(".sig");
@@ -129,29 +195,104 @@ pub async fn publish(ctx: &RepoCtx, pkg_files: &[PathBuf]) -> paur_core::Result<
         sign(&ctx.gpg_home, &ctx.gpg_key, pkg).await?;
     }
 
+    // Best-effort cleanup of the staging dir.
+    if let Some(stage_dir) = staged.first().and_then(|p| p.parent().map(|_| ctx.repo_dir.join(".stage"))) {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
+
+    // Optional S3 upload. The DB, every newly signed .pkg.tar.zst,
+    // and every .sig are uploaded. Failures here are non-fatal:
+    // the build succeeded and the local repo is consistent; we log
+    // and keep going. S3 re-sync would be a separate maintenance
+    // task. `paur-s3` already retries transient errors.
+    if let Some(s3_cfg) = ctx.s3.clone() {
+        let client = paur_s3::S3Client::new(s3_cfg);
+        // 1) Upload the DB and its sig.
+        let db_key = format!("{}/{}.db.tar.gz", ctx.arch, ctx.db_basename());
+        let db_path = ctx.db_path();
+        if let Err(e) = upload_path(&client, &db_key, "application/x-gzip", &db_path).await {
+            tracing::warn!(error = %e, key = %db_key, "s3: db upload failed");
+        }
+        // 2) Upload each pkg + its sig.
+        for pkg in &staged {
+            let name = match pkg.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let pkg_key = format!("{}/{}", ctx.arch, name);
+            if let Err(e) = upload_path(&client, &pkg_key, "application/zstd", pkg).await {
+                tracing::warn!(error = %e, key = %pkg_key, "s3: pkg upload failed");
+            }
+            let sig_key = format!("{}/{}.sig", ctx.arch, name);
+            let sig_path = {
+                let mut s = pkg.as_os_str().to_owned();
+                s.push(".sig");
+                PathBuf::from(s)
+            };
+            if sig_path.exists() {
+                if let Err(e) =
+                    upload_path(&client, &sig_key, "application/pgp-signature", &sig_path).await
+                {
+                    tracing::warn!(error = %e, key = %sig_key, "s3: sig upload failed");
+                }
+            }
+        }
+        // 3) Upload the paur.files tarball (clients fetch this too).
+        let files_key = format!("{}/{}.files.tar.gz", ctx.arch, ctx.db_basename());
+        let files_path = {
+            let mut s = ctx.db_path().into_os_string();
+            s.push(".files.tar.gz");
+            let p = PathBuf::from(s);
+            // The DB basename is e.g. "paur"; the files tarball is
+            // "paur.files.tar.gz". Strip the duplicated ".db" first.
+            // Easier: re-derive from repo_name.
+            drop(p);
+            ctx.repo_dir.join(&ctx.arch).join(format!("{}.files.tar.gz", ctx.repo_name))
+        };
+        if files_path.exists() {
+            if let Err(e) =
+                upload_path(&client, &files_key, "application/x-gzip", &files_path).await
+            {
+                tracing::warn!(error = %e, key = %files_key, "s3: files upload failed");
+            }
+        }
+    }
+
     Ok(db_sig)
 }
 
-/// Remove a package from the repo DB and sign the updated DB.
+/// Read `path` and PUT it to S3 at `key`. Logs success at INFO.
+async fn upload_path(
+    client: &paur_s3::S3Client,
+    key: &str,
+    content_type: &str,
+    path: &Path,
+) -> paur_core::Result<String> {
+    let bytes = tokio::fs::read(path).await.map_err(|e| {
+        paur_core::Error::Repo(format!("read {} for s3: {e}", path.display()))
+    })?;
+    let url = client.put(key, content_type, bytes).await.map_err(|e| {
+        paur_core::Error::Repo(format!("s3 put {key}: {e}"))
+    })?;
+    tracing::info!(key = %key, url = %url, "s3: uploaded");
+    Ok(url)
+}
+
+/// Remove a package from the repo DB and sign the updated DB. The
+/// `.pkg.tar.*` file itself is left in place; callers should unlink
+/// it after this returns.
 pub async fn remove(ctx: &RepoCtx, pkg: &PkgName) -> paur_core::Result<()> {
-    let db_arg = ctx
-        .db_path_for_repo_add()
-        .to_str()
-        .ok_or_else(|| paur_core::Error::Repo("non-utf8 db path".into()))?
-        .to_string();
-    let mut cmd = Command::new("repo-remove");
-    cmd.arg(&db_arg).arg(pkg.as_str());
-    cmd.stdin(Stdio::null());
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| paur_core::Error::Repo(format!("spawn repo-remove: {e}")))?;
-    if !out.status.success() {
-        return Err(paur_core::Error::Repo(format!(
-            "repo-remove failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
+    remove_with(ctx, pkg, &ContainerRepoOps).await
+}
+
+/// Same as [`remove`] but with an injectable [`RepoOps`].
+pub async fn remove_with(
+    ctx: &RepoCtx,
+    pkg: &PkgName,
+    ops: &dyn RepoOps,
+) -> paur_core::Result<()> {
+    ops.remove(ctx, &ctx.db_basename(), pkg.as_str()).await?;
+
     // Re-sign the DB.
     let db_sig = ctx.db_sig();
     let _ = std::fs::remove_file(&db_sig);
@@ -173,7 +314,7 @@ pub async fn export_pubkey(
         .args(["--armor", "--export", keyid])
         .stdin(Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(std::process::Stdio::piped());
     let output = cmd
         .output()
         .await
@@ -242,8 +383,6 @@ pub async fn list_signing_key(gpg_home: &Path, email: &str) -> paur_core::Result
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-    // The "fpr" line carries the long fingerprint; the first such
-    // record belongs to the primary key.
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         if line.starts_with("fpr:") {
@@ -309,114 +448,50 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Build a minimal real arch package using `makepkg`. The result
-    /// is accepted by `repo-add`/`repo-remove`; the synthetic
-    /// archives we build in unit tests aren't.
-    async fn make_real_pkg(work: &Path) -> PathBuf {
-        let pkgbuild = work.join("PKGBUILD");
-        std::fs::write(
-            &pkgbuild,
-            b"pkgname=paur-fixture\n\
-              pkgver=1.0\n\
-              pkgrel=1\n\
-              arch=('x86_64')\n\
-              package() { install -d \"$pkgdir/usr\"; \
-                          echo hello > \"$pkgdir/usr/hello\"; }\n",
-        )
-        .unwrap();
-        let status = std::process::Command::new("makepkg")
-            .args(["-sf", "--noconfirm"])
-            .current_dir(work)
-            .status()
-            .unwrap();
-        assert!(status.success(), "makepkg failed in fixture build");
-        let pkg = std::fs::read_dir(work)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("paur-fixture-") && n.ends_with(".pkg.tar.zst"))
-                    .unwrap_or(false)
-            })
-            .expect("no .pkg.tar.zst produced");
-        pkg
+    /// Test double that records calls instead of touching the host or
+    /// a container. Lets the publish/remove code paths run end-to-end
+    /// in a unit test.
+    struct MockOps {
+        adds: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+        removes: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    /// Make a minimal valid `.pkg.tar.zst` for testing. The contents
-    /// aren't a real arch package; we craft the *shape* (compressed
-    /// tar with the right per-package metadata) just well enough that
-    /// `repo-add` accepts the file.
-    fn make_fake_pkg(path: &Path) {
-        let tmp = tempfile::tempdir().unwrap();
-        let staging = tmp.path().join("staging");
-        std::fs::create_dir_all(&staging).unwrap();
-        // repo-add inspects .PKGINFO; missing or malformed fields
-        // (pkgver, pkgrel, arch) cause it to reject the package.
-        std::fs::write(
-            staging.join(".PKGINFO"),
-            b"pkgname = foo\npkgver = 1.0\npkgrel = 1\narch = x86_64\n",
-        )
-        .unwrap();
-        std::fs::write(
-            staging.join(".MTREE"),
-            b"fake mtree\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(staging.join("usr")).unwrap();
-        std::fs::write(staging.join("usr").join("hello"), b"hi\n").unwrap();
-
-        let tar_path = tmp.path().join("pkg.tar");
-        let status = std::process::Command::new("bsdtar")
-            .args([
-                "--format=ustar",
-                "-C",
-                staging.to_str().unwrap(),
-                "-cf",
-                tar_path.to_str().unwrap(),
-                ".PKGINFO",
-                ".MTREE",
-                "usr",
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success(), "bsdtar failed");
-
-        let status = std::process::Command::new("zstd")
-            .args([
-                "-q",
-                "-f",
-                "-o",
-                path.to_str().unwrap(),
-                tar_path.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success(), "zstd failed");
+    impl MockOps {
+        fn new() -> Self {
+            Self {
+                adds: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                removes: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
+        }
     }
 
-    /// `repo-add`, `gpg`, and `makepkg` are system tools. Skip their
-    /// tests when unavailable so unit tests still pass on minimal CI
-    /// images.
-    fn have_repo_add() -> bool {
-        which("repo-add")
+    #[async_trait]
+    impl RepoOps for MockOps {
+        async fn add(&self, _ctx: &RepoCtx, _db: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()> {
+            let names: Vec<String> = pkg_files
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                .collect();
+            // Simulate repo-add's behavior of (re)writing the DB file.
+            // Touch a stub .db.tar.gz so the post-publish assertions
+            // find something on disk.
+            if let Some(p) = pkg_files.first() {
+                if let Some(dir) = p.parent() {
+                    std::fs::write(dir.join("paur.db.tar.gz"), b"fake-db").unwrap();
+                }
+            }
+            self.adds.lock().await.push(names);
+            Ok(())
+        }
+        async fn remove(&self, _ctx: &RepoCtx, _db: &str, pkgname: &str) -> paur_core::Result<()> {
+            self.removes.lock().await.push(pkgname.to_string());
+            Ok(())
+        }
     }
+
     fn have_gpg() -> bool {
-        which("gpg")
-    }
-    fn have_makepkg() -> bool {
-        which("makepkg")
-    }
-    fn have_bsdtar() -> bool {
-        which("bsdtar")
-    }
-    fn have_zstd() -> bool {
-        which("zstd")
-    }
-    fn which(bin: &str) -> bool {
         std::process::Command::new("which")
-            .arg(bin)
+            .arg("gpg")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -432,24 +507,27 @@ mod tests {
             repo_dir: PathBuf::from("/var/lib/paur/repo"),
             gpg_home: PathBuf::from("/var/lib/paur/.gnupg"),
             gpg_key: "DEADBEEF".into(),
+            container_runtime: ContainerRuntime::Docker,
+            builder_image: "paur-builder:latest".into(),
+            s3: None,
         };
         assert_eq!(ctx.arch_dir(), PathBuf::from("/var/lib/paur/repo/x86_64"));
+        assert_eq!(ctx.db_basename(), "paur.db.tar.gz");
     }
 
     #[tokio::test]
-    async fn publish_then_remove_roundtrip() {
-        if !(have_repo_add() && have_gpg() && have_makepkg()) {
-            eprintln!("repo-add/gpg/makepkg missing; skipping");
+    async fn publish_then_remove_roundtrip_via_mock() {
+        if !have_gpg() {
+            eprintln!("gpg missing; skipping");
             return;
         }
         let tmp = tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         let gpg_home = tmp.path().join("gnupg");
-        let pkg_work = tmp.path().join("pkgbuild");
+        let stage = tmp.path().join("stage");
         std::fs::create_dir_all(&repo_dir).unwrap();
-        std::fs::create_dir_all(&pkg_work).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
 
-        // Generate a throwaway signing key.
         let fpr = generate_key(&gpg_home, "paur-test", "paur-test@example.invalid")
             .await
             .unwrap();
@@ -461,62 +539,32 @@ mod tests {
             repo_dir: repo_dir.clone(),
             gpg_home: gpg_home.clone(),
             gpg_key: fpr.clone(),
+            container_runtime: ContainerRuntime::Docker,
+            builder_image: "paur-builder:latest".into(),
+            s3: None,
         };
 
-        // Build a real arch package with makepkg.
-        let artifact = make_real_pkg(&pkg_work).await;
+        // Fake a .pkg.tar.* that makepkg would have produced.
+        let artifact = stage.join("foo-1.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&artifact, b"fake").unwrap();
 
-        publish(&ctx, &[artifact.clone()]).await.unwrap();
+        let mock = MockOps::new();
+        publish_with(&ctx, std::slice::from_ref(&artifact), &mock)
+            .await
+            .unwrap();
+        // .pkg.tar.* copied into the arch dir
+        assert!(ctx.arch_dir().join(artifact.file_name().unwrap()).exists());
+        // .db.tar.gz written and signed
         assert!(ctx.arch_dir().join("paur.db.tar.gz").exists());
         assert!(ctx.db_sig().exists());
-        assert!(ctx
-            .arch_dir()
-            .join(artifact.file_name().unwrap())
-            .exists());
+        // Mock recorded the add
+        assert_eq!(mock.adds.lock().await.len(), 1);
 
-        // Remove the package; use the canonical name from .PKGINFO.
-        let canonical = discover_pkgname(&ctx).await.unwrap();
-        remove(&ctx, &canonical).await.unwrap();
+        // Now remove.
+        let pkg = paur_core::PkgName::new("foo").unwrap();
+        remove_with(&ctx, &pkg, &mock).await.unwrap();
+        let removed = mock.removes.lock().await.clone();
+        assert_eq!(removed, vec!["foo".to_string()]);
         assert!(ctx.db_sig().exists());
-    }
-
-    /// `repo-add` records the package under whatever pkgname appears
-    /// in the archive's `.PKGINFO`. Our test sets that to `foo`, but
-    /// in practice the `bsdtar` produced for the roundtrip also gets
-    /// re-archived. Read the `.PKGINFO` from the on-disk artifact to
-    /// be sure of the name before removing.
-    async fn discover_pkgname(
-        ctx: &RepoCtx,
-    ) -> Result<paur_core::PkgName, paur_core::Error> {
-        use std::process::Stdio;
-        for entry in std::fs::read_dir(ctx.arch_dir())
-            .map_err(|e| paur_core::Error::Repo(e.to_string()))?
-        {
-            let entry = entry.map_err(|e| paur_core::Error::Repo(e.to_string()))?;
-            let p = entry.path();
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if name.ends_with(".pkg.tar.zst") {
-                let out = std::process::Command::new("bsdtar")
-                    .args(["xOf"])
-                    .arg(&p)
-                    .arg(".PKGINFO")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output()
-                    .unwrap();
-                let s = String::from_utf8_lossy(&out.stdout);
-                for line in s.lines() {
-                    if let Some(rest) = line.strip_prefix("pkgname =") {
-                        let n = rest.trim();
-                        return paur_core::PkgName::new(n);
-                    }
-                }
-            }
-        }
-        Err(paur_core::Error::Repo("no pkgname found".into()))
     }
 }
