@@ -1,19 +1,15 @@
 <script lang="ts">
-  // Install page. Renders a copy-pasteable bootstrap for a fresh
-  // Arch client. The hostname defaults to the browser's current
-  // host (which is the same one the user is using to view this
-  // page), so the rendered commands "just work" for almost every
-  // deployment — the only edit usually needed is replacing the
-  // placeholder for the GPG fingerprint, which the page extracts
-  // on the client side from the served pubkey.
+  // Install page. Renders four copy-pasteable blocks for a fresh
+  // Arch client: (0) find the FPR, (1) bootstrap the GPG key,
+  // (2) install the keyring + mirrorlist meta-packages, (3) enable
+  // the repo in pacman.conf. The hostname defaults to the browser's
+  // current host, so the rendered commands "just work" for almost
+  // every deployment.
   //
-  // Block 0 derives the FPR by fetching the same pubkey the README
-  // points at and parsing it in-browser via the OpenPGP.js WebCrypto
-  // path. We avoid shipping a full OpenPGP.js bundle: instead we
-  // rely on the fact that `gpg --show-keys` on the client prints
-  // a stable, machine-parseable line. The README's
-  // `gpg --import-options show-only --import <(curl ...)` flow is
-  // what the *client* runs, so the user just copies each block.
+  // The shape mirrors chaotic-aur's docs (https://aur.chaotic.cx/),
+  // but we extract the FPR on the client side via the same
+  // `gpg --import-options show-only --import` flow rather than
+  // relying on a public keyserver.
 
   import { onMount } from 'svelte';
 
@@ -27,19 +23,13 @@
     host = location.host;
   });
 
-  // Extract the primary FPR by asking the daemon to do the parse
-  // server-side. The server already has GPG available (it signs
-  // repo DBs with it), so this is cheaper than bundling a parser
-  // into the UI bundle. We hand the daemon the pubkey it just
-  // served via /repo and let it hand us back the FPR.
-  //
-  // If the daemon is older than this endpoint, the call returns
-  // 404 and we degrade to the curl+awk command in block 0.
+  // Server-side FPR helper. Avoids shipping a PGP parser in the UI
+  // bundle: the daemon already has GPG on PATH (it signs repo DBs
+  // with it), so we just ask it to parse its own pubkey. If the
+  // daemon is older than this endpoint, we fall back to the
+  // client-side FPR extraction in block 0.
   async function fetchFpr() {
     try {
-      // Use the same pubkey URL the install blocks reference, but
-      // send it to a thin server-side parser. The endpoint isn't
-      // part of the public API surface — it's a UI helper.
       const r = await fetch(`/api/v1/install/fpr?host=${encodeURIComponent(host)}`);
       if (!r.ok) {
         fprError = `fpr endpoint returned ${r.status}; copy block 0 verbatim instead`;
@@ -61,8 +51,10 @@
   const blocks = $derived([
     // 0. Find the FPR. We can do this client-side via the same
     //    `gpg --import-options show-only --import` the README
-    //    documents, OR we can have the daemon do it for us. We
-    //    default to the latter when the endpoint is available.
+    //    documents, OR we can have the daemon do it for us (the
+    //    "Resolve FPR server-side" button above). We default to
+    //    the client-side flow so the copy-paste works without a
+    //    click first.
     block(
       0,
       `# Find this server's GPG fingerprint (40 hex chars)
@@ -71,10 +63,9 @@ FPR=$(curl -sSL ${repoRoot}/paur.pubkey.asc \\
         | awk '/^pub/{print $2}' | head -1 | cut -d/ -f2)
 echo "$FPR"`
     ),
-    // 1. Bootstrap: import + lsign. This step is the only one
-    //    that needs interactive trust — pacman-key --lsign-key
-    //    prompts for the local keyring's passphrase, which
-    //    defaults to empty on a fresh install.
+    // 1. Bootstrap: add the pubkey to the local keyring and lsign
+    //    it. pacman-key --lsign-key prompts for the local keyring's
+    //    passphrase, which defaults to empty on a fresh install.
     block(
       1,
       `# Bootstrap: add the pubkey to the local keyring and lsign it.
@@ -84,8 +75,8 @@ sudo pacman-key --lsign-key "$FPR"`
     // 2. Install the keyring + mirrorlist meta-packages. The
     //    post-install hook on `paur-keyring` runs
     //    `pacman-key --populate paur`, which re-imports the
-    //    pubkey and lsigns every FPR in
-    //    `paur-trusted` at full trust.
+    //    pubkey and lsigns every FPR in `paur-trusted` at full
+    //    trust.
     block(
       2,
       `# Install the keyring + mirrorlist meta-packages.
@@ -181,17 +172,14 @@ sudo pacman -Sy hello-pkg`
   {/each}
 </div>
 
-<div class="mt-8 rounded-lg border p-4 text-xs" style="border-color: var(--hairline); background: var(--bg-card); color: var(--body);">
-  <strong style="color: var(--ink);">Why a separate bootstrap?</strong>
+<div class="mt-8 text-xs" style="color: var(--mute);">
   paur's GPG key is generated locally on the server and is not
-  published to any keyserver, so the very first
-  <code>pacman -U</code> cannot validate the keyring package's
-  signature until you've manually added the key to your client's
-  keyring. The four steps above are the same flow described in
-  <code>README.md</code> and <code>deploy/README.md</code> — once
-  the keyring package is installed, its post-install hook
-  re-imports the pubkey and lsigns it at full trust, so all
-  subsequent <code>pacman -U</code> and <code>pacman -Sy</code>
-  invocations on <code>paur-*</code> packages are
-  signature-validated automatically.
+  published to any keyserver, so the very first <code>pacman -U</code>
+  cannot validate the keyring package's signature until you've
+  manually added the key (step 1) and installed the keyring
+  package (step 2). After that, the keyring's post-install hook
+  re-imports the pubkey at full trust, so subsequent
+  <code>pacman -U</code> and <code>pacman -Sy</code> invocations
+  on <code>paur-*</code> packages are signature-validated
+  automatically.
 </div>
