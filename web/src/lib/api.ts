@@ -155,12 +155,7 @@ export const api = {
       if (!r.ok) throw new ApiError(r.status, `logs ${id}: ${r.status}`);
       return r.text();
     }),
-  queue: () => getJson<Queue>('/api/v1/queue'),
-  pubkey: () =>
-    fetch('/api/v1/pubkey', { credentials: 'include' }).then((r) => {
-      if (!r.ok) throw new ApiError(r.status, `pubkey: ${r.status}`);
-      return r.text();
-    })
+  queue: () => getJson<Queue>('/api/v1/queue')
 };
 
 export { ApiError };

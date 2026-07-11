@@ -22,7 +22,7 @@
           { href: '/', label: 'Dashboard' },
           { href: '/packages', label: 'Packages' },
           { href: '/queue', label: 'Queue' },
-          { href: '/pubkey', label: 'Pubkey' }
+          { href: '/install', label: 'Install' }
         ] as item}
           {@const active = $page.url.pathname === item.href || ($page.url.pathname.startsWith(item.href) && item.href !== '/')}
           <a

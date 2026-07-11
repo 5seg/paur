@@ -1,7 +1,8 @@
 //! HTTP API for the paur daemon.
 //!
 //! All routes are mounted under `/api/v1`. We expose the same surface
-//! the Web UI consumes plus a few read-only helpers (health, pubkey).
+//! the Web UI consumes plus a few read-only helpers (health,
+//! install-time FPR lookup).
 //!
 //! Listen mode is taken from the daemon [`Config`]. A unix socket is
 //! the default; `0.0.0.0:port` is supported too — see
@@ -39,7 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/builds/:id/logs", get(stream_logs))
         .route("/api/v1/builds/:id/logs.txt", get(raw_logs))
         .route("/api/v1/queue", get(queue))
-        .route("/api/v1/pubkey", get(pubkey))
+        .route("/api/v1/install/fpr", get(install_fpr))
         .route("/api/v1/repo/:arch/*file", get(serve_repo_file))
         .merge(auth::router());
     api.with_state(Arc::new(state))
@@ -460,21 +461,34 @@ async fn queue(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json:
     })))
 }
 
-async fn pubkey(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    // The pubkey lives in the arch-specific dir, alongside the
-    // .pkg.tar.zst files, so it is colocated with the rest of the
-    // repo a client fetches. `paur-cli init` writes it there.
+/// `GET /api/v1/install/fpr` — UI helper for the Install page. Reads
+/// the served pubkey from the arch dir, runs `gpg --show-keys` on
+/// it, and returns the primary FPR. This avoids shipping a PGP
+/// parser in the UI bundle: the daemon already has GPG on PATH
+/// (it uses it to sign the repo DB).
+#[derive(Deserialize)]
+struct InstallFprQuery {
+    /// Host the client will reach. Unused on the server side, but
+    /// kept in the request so the UI can render a single URL that
+    /// round-trips through the same install flow it documents.
+    #[allow(dead_code)]
+    host: String,
+}
+
+async fn install_fpr(
+    State(state): State<Arc<AppState>>,
+    Query(_q): Query<InstallFprQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
     let pubkey_path = state.repo.arch_dir().join("paur.pubkey.asc");
-    match std::fs::read(&pubkey_path) {
-        Ok(b) => Ok((
-            [(axum::http::header::CONTENT_TYPE, "application/pgp-keys")],
-            b,
-        )
-            .into_response()),
-        Err(_) => Err(ApiError(paur_core::Error::NotFound(
+    let bytes = tokio::fs::read(&pubkey_path)
+        .await
+        .map_err(|_| paur_core::Error::NotFound(
             "pubkey not exported yet; run `paur init`".into(),
-        ))),
-    }
+        ))?;
+    let fpr = paur_repo::primary_fpr(&bytes).await.map_err(|e| {
+        ApiError(paur_core::Error::Invalid(format!("gpg parse: {e}")))
+    })?;
+    Ok(Json(serde_json::json!({ "fpr": fpr })))
 }
 
 /// Serve a single file from the arch-specific repo dir. Mounted at

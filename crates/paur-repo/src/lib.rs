@@ -397,6 +397,57 @@ pub async fn list_signing_key(gpg_home: &Path, email: &str) -> paur_core::Result
     )))
 }
 
+/// Extract the primary fingerprint from an ASCII-armored PGP
+/// public key blob. Used by the daemon's `/api/v1/install/fpr`
+/// helper to feed the Install page without bundling a PGP parser
+/// into the UI.
+///
+/// We pipe the key into `gpg --show-keys --with-colons` so we
+/// don't have to write a parser here — `gpg` is the source of
+/// truth for the wire format anyway. The first `fpr:` line is
+/// the primary key's fingerprint; subkeys would appear on later
+/// lines.
+pub async fn primary_fpr(pubkey_bytes: &[u8]) -> paur_core::Result<String> {
+    let mut cmd = Command::new("gpg");
+    cmd.args(["--show-keys", "--with-colons"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        paur_core::Error::Gpg(format!("spawn gpg --show-keys: {e}"))
+    })?;
+    use tokio::io::AsyncWriteExt as _;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(pubkey_bytes).await.map_err(|e| {
+            paur_core::Error::Gpg(format!("gpg stdin: {e}"))
+        })?;
+    }
+    let out = child.wait_with_output().await.map_err(|e| {
+        paur_core::Error::Gpg(format!("gpg --show-keys: {e}"))
+    })?;
+    if !out.status.success() {
+        return Err(paur_core::Error::Gpg(format!(
+            "gpg --show-keys failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        // `--with-colons` writes `fpr::::::::::<HEX>:`; field 9
+        // (0-indexed) is the FPR. We pick the first one, which
+        // is the primary key; subkeys come after.
+        if line.starts_with("fpr:") {
+            let fpr = line.split(':').nth(9).unwrap_or("").trim();
+            if !fpr.is_empty() {
+                return Ok(fpr.to_string());
+            }
+        }
+    }
+    Err(paur_core::Error::Gpg(
+        "no primary fingerprint in pubkey".into(),
+    ))
+}
+
 /// Produce a detached GPG signature for `target` inside
 /// `gpg_home`. The signature is written next to `target` with the
 /// `.sig` extension (pacman convention). Removes any existing `.sig`
