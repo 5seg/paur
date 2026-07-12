@@ -12,6 +12,11 @@
 //! 2. `rust_codegen_units_1` — appends `-C codegen-units=1` to `RUSTFLAGS`
 //!                             (preserves any existing `RUSTFLAGS`)
 //! 3. `no_ccache`            — skips the ccache bind mount entirely
+//! 4. `march`                — x86-64 microarchitecture level (v3 / v4).
+//!                             Replaces CFLAGS with a CachyOS-style
+//!                             `-march=x86-64-vN -O2 -pipe -fno-plt`,
+//!                             sets CXXFLAGS to the same, and appends
+//!                             `-C target-cpu=x86-64-vN` to RUSTFLAGS.
 //!
 //! The same struct is used by:
 //! - `paur-db` to serialize/deserialize the column
@@ -23,6 +28,35 @@
 //! serialized blobs keep deserializing.
 
 use serde::{Deserialize, Serialize};
+
+/// x86-64 microarchitecture level. Determines which CPU features
+/// the package's C / C++ / Rust code may assume at build time.
+/// See <https://wiki.cachyos.org/cachyos_basic/why_cachyos/> for
+/// the performance rationale.
+///
+/// Serialized as the lowercase string of the variant name
+/// (`"v3"` / `"v4"`). Adding a new variant (e.g. `V2`) is the only
+/// place to touch: the build.sh `apply_march` case statement must
+/// learn the new value, and the SvelteKit UI must add a button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarchLevel {
+    /// x86-64-v3 — Haswell / Excavator and later. AVX2, BMI2, FMA.
+    V3,
+    /// x86-64-v4 — Skylake-X / Zen 4 and later. Adds AVX-512.
+    V4,
+}
+
+impl MarchLevel {
+    /// Lowercase string used both for the JSON value and the
+    /// `PAUR_MARCH` env var that crosses into the build container.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarchLevel::V3 => "v3",
+            MarchLevel::V4 => "v4",
+        }
+    }
+}
 
 /// Build tuning flags for a single package. See module docs for
 /// semantics. Default = empty (all `false`), meaning "use daemon
@@ -50,19 +84,29 @@ pub struct PackageBuildFlags {
     /// ccache might mask.
     #[serde(default)]
     pub no_ccache: bool,
+
+    /// x86-64 microarchitecture level. `None` means "use the
+    /// container's default `makepkg.conf`" (i.e. generic x86-64).
+    /// Set to `Some(V3)` / `Some(V4)` to opt this package into
+    /// CachyOS-style `-march=...` builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub march: Option<MarchLevel>,
 }
 
 impl PackageBuildFlags {
     /// True when no override is set. Used to skip writing
     /// `{}` blobs and to short-circuit build-time checks.
     pub fn is_empty(&self) -> bool {
-        !self.low_memory && !self.rust_codegen_units_1 && !self.no_ccache
+        !self.low_memory
+            && !self.rust_codegen_units_1
+            && !self.no_ccache
+            && self.march.is_none()
     }
 
     /// Merge `other` into `self`: any field set in `other` wins,
-    /// and `false` is a no-op (does not clear). Used by `paur-cli`
-    /// when toggling a single flag on, and by callers that only
-    /// ever set flags to `true`.
+    /// and `false` / `None` is a no-op (does not clear). Used by
+    /// `paur-cli` when toggling a single flag on, and by callers
+    /// that only ever set flags to `true`.
     pub fn merge_from(&mut self, other: &PackageBuildFlags) {
         if other.low_memory {
             self.low_memory = true;
@@ -73,6 +117,9 @@ impl PackageBuildFlags {
         if other.no_ccache {
             self.no_ccache = true;
         }
+        if let Some(level) = other.march {
+            self.march = Some(level);
+        }
     }
 
     /// Replace every field of `self` with the corresponding field
@@ -82,6 +129,7 @@ impl PackageBuildFlags {
         self.low_memory = other.low_memory;
         self.rust_codegen_units_1 = other.rust_codegen_units_1;
         self.no_ccache = other.no_ccache;
+        self.march = other.march;
     }
 }
 
@@ -96,6 +144,7 @@ mod tests {
         assert!(!f.low_memory);
         assert!(!f.rust_codegen_units_1);
         assert!(!f.no_ccache);
+        assert!(f.march.is_none());
     }
 
     #[test]
@@ -110,6 +159,7 @@ mod tests {
         assert!(f.low_memory);
         assert!(!f.rust_codegen_units_1);
         assert!(!f.no_ccache);
+        assert!(f.march.is_none());
     }
 
     #[test]
@@ -124,8 +174,42 @@ mod tests {
                 low_memory: true,
                 rust_codegen_units_1: true,
                 no_ccache: true,
+                march: None,
             }
         );
+    }
+
+    #[test]
+    fn deserialize_march_lowercase() {
+        let v3: PackageBuildFlags =
+            serde_json::from_str(r#"{"march": "v3"}"#).unwrap();
+        assert_eq!(v3.march, Some(MarchLevel::V3));
+        let v4: PackageBuildFlags =
+            serde_json::from_str(r#"{"march": "v4"}"#).unwrap();
+        assert_eq!(v4.march, Some(MarchLevel::V4));
+    }
+
+    #[test]
+    fn serialize_march_omits_none() {
+        // skip_serializing_if keeps old blobs that only carry
+        // bool flags from gaining a useless `"march": null`
+        // entry on round-trip.
+        let f = PackageBuildFlags {
+            low_memory: true,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(!s.contains("march"), "got: {s}");
+    }
+
+    #[test]
+    fn serialize_march_lowercase() {
+        let f = PackageBuildFlags {
+            march: Some(MarchLevel::V4),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains(r#""march":"v4""#), "got: {s}");
     }
 
     #[test]
@@ -134,6 +218,7 @@ mod tests {
             low_memory: true,
             rust_codegen_units_1: false,
             no_ccache: true,
+            march: Some(MarchLevel::V3),
         };
         let s = serde_json::to_string(&f).unwrap();
         let back: PackageBuildFlags = serde_json::from_str(&s).unwrap();
@@ -150,11 +235,13 @@ mod tests {
             low_memory: true,
             rust_codegen_units_1: true,
             no_ccache: false,
+            march: Some(MarchLevel::V4),
         };
         a.merge_from(&b);
         assert!(a.low_memory);
         assert!(a.rust_codegen_units_1);
         assert!(!a.no_ccache);
+        assert_eq!(a.march, Some(MarchLevel::V4));
     }
 
     #[test]
@@ -164,11 +251,13 @@ mod tests {
         // explicit clears via a separate "set to false" path.
         let mut a = PackageBuildFlags {
             low_memory: true,
+            march: Some(MarchLevel::V3),
             ..Default::default()
         };
         let b = PackageBuildFlags::default();
         a.merge_from(&b);
         assert!(a.low_memory, "merge_from must not clear existing flags");
+        assert_eq!(a.march, Some(MarchLevel::V3));
     }
 
     #[test]
@@ -182,29 +271,31 @@ mod tests {
             low_memory: true,
             rust_codegen_units_1: true,
             no_ccache: true,
+            march: Some(MarchLevel::V3),
         };
-        let b = PackageBuildFlags {
-            low_memory: false,
-            rust_codegen_units_1: false,
-            no_ccache: false,
-        };
+        let b = PackageBuildFlags::default();
         a.replace_from(&b);
         assert!(a.is_empty());
     }
 
     #[test]
-    fn replace_preserves_unmentioned() {
-        // Unlike a Partial JSON body, replace_from takes a
-        // fully-deserialized PackageBuildFlags so every field is
-        // mentioned. The default is `false`; a UI that always
-        // sends a complete state thus effectively clears unused
-        // keys without needing an extra DELETE endpoint.
+    fn replace_overrides_march() {
+        // replace_from must swap march outright, not merge it.
         let mut a = PackageBuildFlags {
-            low_memory: true,
+            march: Some(MarchLevel::V3),
             ..Default::default()
         };
-        let b = PackageBuildFlags::default();
+        let b = PackageBuildFlags {
+            march: Some(MarchLevel::V4),
+            ..Default::default()
+        };
         a.replace_from(&b);
-        assert!(a.is_empty());
+        assert_eq!(a.march, Some(MarchLevel::V4));
+    }
+
+    #[test]
+    fn march_level_as_str() {
+        assert_eq!(MarchLevel::V3.as_str(), "v3");
+        assert_eq!(MarchLevel::V4.as_str(), "v4");
     }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
-  import { api, fmtTs, type Package, type Build, type PackageBuildFlags } from '$lib/api';
+  import { api, fmtTs, type Package, type Build, type PackageBuildFlags, type MarchLevel } from '$lib/api';
   import { authState } from '$lib/auth';
   import { goto } from '$app/navigation';
   import { ApiError } from '$lib/api';
@@ -18,7 +18,8 @@
   const EMPTY_FLAGS: PackageBuildFlags = {
     low_memory: false,
     rust_codegen_units_1: false,
-    no_ccache: false
+    no_ccache: false,
+    march: null
   };
   function currentFlags(): PackageBuildFlags {
     return pkg?.build_flags ?? EMPTY_FLAGS;
@@ -104,6 +105,28 @@
     }
   }
 
+  let pendingMarch = $state(false);
+  let curMarch = $derived(currentFlags().march ?? null);
+  async function setMarch(level: MarchLevel | null) {
+    if (!pkg || pendingMarch) return;
+    const prev = currentFlags();
+    const next: PackageBuildFlags = { ...prev, march: level };
+    pendingMarch = true;
+    pkg = { ...pkg, build_flags: next };
+    try {
+      pkg = await api.setBuildFlags(pkg.name, next);
+    } catch (e) {
+      pkg = pkg ? { ...pkg, build_flags: prev } : pkg;
+      if (e instanceof ApiError && e.status === 401) {
+        goto('/login');
+        return;
+      }
+      alert(`march set failed: ${e}`);
+    } finally {
+      pendingMarch = false;
+    }
+  }
+
   const buildColumns = [
     { key: 'num', label: '#', class: 'w-20' },
     { key: 'status', label: 'Status', class: 'w-28' },
@@ -162,7 +185,7 @@
     build is unaffected. Send <code class="rounded px-1" style="background: var(--bg-elevated); color: var(--body);">true</code> to enable, leave the rest alone.
   </p>
   <div class="card-vercel mb-6 space-y-2 p-3 text-sm">
-    {#snippet flagRow(key: keyof PackageBuildFlags, label: string, hint: string)}
+    {#snippet flagRow(key: keyof Omit<PackageBuildFlags, 'march'>, label: string, hint: string)}
       {@const on = currentFlags()[key]}
       {@const busy = !!pendingFlag[key]}
       <div class="flex items-start gap-3">
@@ -208,6 +231,38 @@
       'No ccache',
       "Skip the ccache bind mount. Use when ccache misses dominate or the cache dir is unhelpfully large."
     )}
+    <div class="flex items-start gap-3 border-t pt-3" style="border-color: var(--hairline);">
+      <div class="flex flex-col items-start gap-1">
+        <div class="flex gap-1">
+          {#each [['v3', 'x86-64-v3'], ['v4', 'x86-64-v4']] as [v, lab]}
+            <button
+              type="button"
+              onclick={() => setMarch(curMarch === v ? null : (v as MarchLevel))}
+              disabled={!$authState.authenticated || pendingMarch}
+              aria-pressed={Boolean(curMarch === v)}
+              class="inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium transition-colors"
+              style={curMarch === v
+                ? 'background: rgba(99, 102, 241, 0.15); border-color: rgba(99, 102, 241, 0.45); color: rgb(165, 168, 245);'
+                : 'background: var(--bg-elevated); border-color: var(--hairline); color: var(--body);'}
+            >
+              {lab}
+            </button>
+          {/each}
+        </div>
+        <div class="text-[11px]" style="color: var(--mute);">
+          {curMarch === null ? '— default (generic x86-64) —' : `march=${curMarch}`}
+        </div>
+      </div>
+      <div class="flex-1">
+        <div class="font-medium" style="color: var(--ink);">x86-64 march</div>
+        <div class="text-xs" style="color: var(--mute);">
+          CachyOS-style <code class="rounded px-1" style="background: var(--bg-elevated); color: var(--body);">-march=x86-64-vN -O2 -pipe -fno-plt</code>:
+          replaces CFLAGS, sets CXXFLAGS to the same, appends
+          <code class="rounded px-1" style="background: var(--bg-elevated); color: var(--body);">-C target-cpu=x86-64-vN</code> to RUSTFLAGS.
+          Click an active level to clear.
+        </div>
+      </div>
+    </div>
   </div>
 
   <h2 class="mb-2 text-lg font-semibold tracking-tight" style="color: var(--ink);">Latest build</h2>

@@ -88,6 +88,11 @@ enum Cmd {
         /// Skip ccache bind mount for this package.
         #[arg(long, value_parser = parse_on_off)]
         no_ccache: Option<bool>,
+        /// x86-64 microarchitecture level: `v3`, `v4`, or `none` to
+        /// clear. Replaces CFLAGS with CachyOS-style
+        /// `-march=x86-64-vN -O2 -pipe -fno-plt`.
+        #[arg(long)]
+        march: Option<String>,
     },
     /// Show the current queue and running builds.
     Queue,
@@ -194,9 +199,10 @@ async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
             low_memory,
             rust_codegen_units_1,
             no_ccache,
+            march,
         } => {
             let c = client(&cfg, cli.api.as_deref());
-            cmd::flag(&c, &name, list, low_memory, rust_codegen_units_1, no_ccache).await
+            cmd::flag(&c, &name, list, low_memory, rust_codegen_units_1, no_ccache, march).await
         }
         Cmd::Queue => {
             let c = client(&cfg, cli.api.as_deref());

@@ -24,7 +24,17 @@ export interface PackageBuildFlags {
   low_memory: boolean;
   rust_codegen_units_1: boolean;
   no_ccache: boolean;
+  /**
+   * x86-64 microarchitecture level. `null`/missing means "use the
+   * container's default makepkg.conf" (generic x86-64). Set to
+   * `"v3"` / `"v4"` to opt the package into CachyOS-style
+   * `-march=x86-64-vN` builds. Older daemons that pre-date this
+   * field omit it; the UI renders it as "default" in that case.
+   */
+  march?: MarchLevel | null;
 }
+
+export type MarchLevel = 'v3' | 'v4';
 
 export interface Package {
   id: number;

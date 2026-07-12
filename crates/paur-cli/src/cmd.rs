@@ -206,7 +206,7 @@ pub async fn rebuild(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// `paur-cli flag <pkg> --list | --low-memory on|off [--rust-codegen-units-1 on|off] [--no-ccache on|off]`
+/// `paur-cli flag <pkg> --list | --low-memory on|off [--rust-codegen-units-1 on|off] [--no-ccache on|off] [--march v3|v4|none]`
 ///
 /// Per-package build tuning flags (memory/CPU countermeasures). The
 /// daemon composes them in a fixed order:
@@ -214,10 +214,12 @@ pub async fn rebuild(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
 /// - `low_memory`             → `MAKEFLAGS=-j2`
 /// - `rust_codegen_units_1`   → appends `-C codegen-units=1` to `RUSTFLAGS`
 /// - `no_ccache`              → skips the ccache bind mount
+/// - `march`                  → CachyOS-style `-march=x86-64-vN`
+///                               CFLAGS / CXXFLAGS / RUSTFLAGS override
 ///
-/// All flags are independent booleans; omitting a flag leaves it
-/// unchanged. `--list` is a read-only path that hits the same
-/// `get_package` endpoint and prints the current state.
+/// All flags are independent; omitting a flag leaves it unchanged.
+/// `--list` is a read-only path that hits the same `get_package`
+/// endpoint and prints the current state.
 pub async fn flag(
     client: &DaemonClient,
     pkg: &str,
@@ -225,19 +227,32 @@ pub async fn flag(
     low_memory: Option<bool>,
     rust_codegen_units_1: Option<bool>,
     no_ccache: Option<bool>,
+    march: Option<String>,
 ) -> Result<(), CmdError> {
     let name = PkgName::new(pkg)?;
+    // Parse the --march value into the nested-Option shape the
+    // inner code expects. None (outer) = flag omitted (no-op);
+    // Some(None) = explicit "clear march"; Some(Some(level)) = set.
+    let march: Option<Option<paur_core::MarchLevel>> = match march {
+        None => None,
+        Some(s) => Some(parse_march_arg(&s).map_err(CmdError::Other)?),
+    };
     // `list` is now handled by `paur-cli get`; we keep the legacy
     // flag here for back-compat. If no toggle flags were passed
     // either way, we just print the current state.
     if list
-        || (low_memory.is_none() && rust_codegen_units_1.is_none() && no_ccache.is_none())
+        || (low_memory.is_none()
+            && rust_codegen_units_1.is_none()
+            && no_ccache.is_none()
+            && march.is_none())
     {
         let p = client.get_package(name.as_str()).await?;
         println!("name:                {}", p.name);
         println!("low_memory:          {}", p.build_flags.low_memory);
         println!("rust_codegen_units_1: {}", p.build_flags.rust_codegen_units_1);
         println!("no_ccache:           {}", p.build_flags.no_ccache);
+        let m = p.build_flags.march.map(|l| l.as_str()).unwrap_or("default");
+        println!("march:               {m}");
         return Ok(());
     }
 
@@ -245,7 +260,8 @@ pub async fn flag(
     // a partial patch. Read the current flags, apply the
     // user-provided overrides, and send the merged result. This
     // matches the WebUI's behaviour and lets the CLI explicitly
-    // turn a flag off (`paur-cli flag <pkg> --low-memory false`).
+    // turn a flag off (`paur-cli flag <pkg> --low-memory false`)
+    // or clear the march level (`paur-cli flag <pkg> --march none`).
     let current = client.get_package(name.as_str()).await?;
     let mut update = current.build_flags;
     if let Some(v) = low_memory {
@@ -257,12 +273,26 @@ pub async fn flag(
     if let Some(v) = no_ccache {
         update.no_ccache = v;
     }
+    if let Some(v) = march {
+        update.march = v;
+    }
     let updated = client.set_build_flags(name.as_str(), &update).await?;
     println!("{} flags updated:", updated.name);
     println!("  low_memory:           {}", updated.build_flags.low_memory);
     println!("  rust_codegen_units_1: {}", updated.build_flags.rust_codegen_units_1);
     println!("  no_ccache:            {}", updated.build_flags.no_ccache);
+    let m = updated.build_flags.march.map(|l| l.as_str()).unwrap_or("default");
+    println!("  march:                {m}");
     Ok(())
+}
+
+fn parse_march_arg(s: &str) -> Result<Option<paur_core::MarchLevel>, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "v3" => Ok(Some(paur_core::MarchLevel::V3)),
+        "v4" => Ok(Some(paur_core::MarchLevel::V4)),
+        "none" | "off" | "default" | "" => Ok(None),
+        other => Err(format!("expected v3|v4|none (got {other:?})")),
+    }
 }
 
 /// `paur-cli pubkey` — fetch and print the GPG pubkey.

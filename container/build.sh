@@ -17,8 +17,38 @@
 #                  (only mounted for `repo` and `unrepo` modes)
 #   /ccache     -- ccache dir (persistent across builds on the host)
 #
-# The script intentionally uses `set -euo pipefail` to fail fast on any
-# error and emit a useful exit code to the host's `paur-builder`.
+# The script intentionally uses `set -euo pipefail
+
+# Apply a per-package x86-64 microarchitecture level when the
+# daemon hands us PAUR_MARCH=v3 or PAUR_MARCH=v4. The recipe is
+# CachyOS-style:
+#   CFLAGS="-march=x86-64-vN -O2 -pipe -fno-plt"
+#   CXXFLAGS=${CFLAGS}
+#   RUSTFLAGS=${RUSTFLAGS:-} -C target-cpu=x86-64-vN
+# - CFLAGS is replaced wholesale (the container's default
+#   makepkg.conf uses generic x86-64; we override that for
+#   the whole build).
+# - CXXFLAGS follows CFLAGS.
+# - RUSTFLAGS is *appended* so PKGBUILDs that export their own
+#   RUSTFLAGS (LTO, codegen-units, etc.) are preserved.
+# When PAUR_MARCH is unset or empty, this is a no-op and the
+# container's default flags take over.
+apply_march() {
+    case "${PAUR_MARCH:-}" in
+        v3|v4)
+            export CFLAGS="-march=x86-64-${PAUR_MARCH} -O2 -pipe -fno-plt"
+            export CXXFLAGS="${CFLAGS}"
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=x86-64-${PAUR_MARCH}"
+            echo "==> paur: march=${PAUR_MARCH} CFLAGS=${CFLAGS}"
+            ;;
+        "")
+            : # no-op: use container makepkg.conf defaults
+            ;;
+        *)
+            echo "==> paur: ignoring unknown PAUR_MARCH='${PAUR_MARCH}'" >&2
+            ;;
+    esac
+}
 
 set -euo pipefail
 
@@ -32,6 +62,11 @@ build_aur() {
     rm -rf /work/src
     git clone --quiet "${url}" /work/src
     cd /work/src
+
+    # Apply the per-package x86-64 march level (no-op if PAUR_MARCH
+    # is unset). Done after the cd so the function's CFLAGS /
+    # CXXFLAGS / RUSTFLAGS exports only affect this build.
+    apply_march
 
     # Apply the per-package RUSTFLAGS override before invoking makepkg.
     # We *append* to whatever the PKGBUILD / makepkg.conf set: rustc
@@ -90,6 +125,10 @@ build_local() {
         export RUSTFLAGS="${RUSTFLAGS:-} -C codegen-units=1"
         echo "==> paur: RUSTFLAGS=${RUSTFLAGS} (codegen-units=1)"
     fi
+
+    # Apply the per-package x86-64 march level (no-op if PAUR_MARCH
+    # is unset).
+    apply_march
 
     # Force PKGDEST to the current directory (where the PKGBUILD
     # was copied to). makepkg's default of `$startdir` ought to

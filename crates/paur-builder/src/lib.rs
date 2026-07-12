@@ -150,6 +150,15 @@ pub async fn run_in_container(
         // the inner makepkg can re-export RUSTFLAGS as needed.
         cmd.arg("-e").arg("PAUR_RUST_CGU=1");
     }
+    if let Some(level) = req.flags.march {
+        // We pass the *level name* (v3 / v4) rather than the
+        // resolved CFLAGS. build.sh owns the actual recipe
+        // (CachyOS-style `-march=x86-64-vN -O2 -pipe -fno-plt`,
+        // CXXFLAGS=${CFLAGS}, RUSTFLAGS append), so changing the
+        // recipe does not require a daemon rebuild.
+        cmd.arg("-e")
+            .arg(format!("PAUR_MARCH={}", level.as_str()));
+    }
     cmd.arg(&req.image)
         .arg(req.pkg.as_str())
         .arg(&req.aur_url)

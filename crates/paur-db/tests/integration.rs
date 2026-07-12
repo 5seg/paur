@@ -251,6 +251,7 @@ async fn build_flags_roundtrip() {
         low_memory: true,
         rust_codegen_units_1: true,
         no_ccache: false,
+        march: None,
     };
     let rows = db
         .set_build_flags("paru-bin", &updated)
