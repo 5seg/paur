@@ -17,7 +17,7 @@ use std::time::Duration;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 
-use paur_core::Config;
+use paur_core::{Config, PackageVariants, Variant};
 
 /// Default TCP fallback the daemon uses when `listen = "unix ..."`.
 const UNIX_FALLBACK_HOSTPORT: &str = "http://127.0.0.1:7300";
@@ -93,19 +93,48 @@ impl DaemonClient {
     }
 
     /// `POST /api/v1/packages` — add a package. Returns the new dto.
+    ///
+    /// `variants` is the set of variants to enable at add time. The
+    /// daemon forces `default` on regardless of what's passed, so
+    /// the caller may omit it. An empty slice means "default only".
     pub async fn add_package(
         &self,
         name: &str,
         auto_rebuild: bool,
+        variants: &[Variant],
     ) -> Result<PackageDto, ClientError> {
         let url = format!("{}/api/v1/packages", self.base);
+        let variant_strs: Vec<&'static str> =
+            variants.iter().map(|v| v.as_str()).collect();
         let resp = self
             .http
             .post(&url)
             .json(&serde_json::json!({
                 "name": name,
                 "auto_rebuild": auto_rebuild,
+                "variants": variant_strs,
             }))
+            .send()
+            .await?;
+        self.parse(resp).await
+    }
+
+    /// `PATCH /api/v1/packages/:name/variants` — replace the
+    /// active variant set for a package. The daemon forces
+    /// `default` on regardless of what's passed, so the caller
+    /// may omit it.
+    pub async fn set_variants(
+        &self,
+        name: &str,
+        variants: &[Variant],
+    ) -> Result<PackageDto, ClientError> {
+        let url = format!("{}/api/v1/packages/{}/variants", self.base, name);
+        let variant_strs: Vec<&'static str> =
+            variants.iter().map(|v| v.as_str()).collect();
+        let resp = self
+            .http
+            .patch(&url)
+            .json(&serde_json::json!({ "variants": variant_strs }))
             .send()
             .await?;
         self.parse(resp).await
@@ -252,7 +281,7 @@ impl DaemonClient {
 }
 
 /// Package DTO mirroring the daemon's response.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct PackageDto {
     pub id: i64,
     pub name: String,
@@ -264,16 +293,30 @@ pub struct PackageDto {
     /// the daemon predates the flags migration.
     #[serde(default)]
     pub build_flags: paur_core::PackageBuildFlags,
+    /// Per-package active variant set. Default = `default` only.
+    /// Older daemons that predate the variants migration omit
+    /// this; the field defaults to `PackageVariants::default()`
+    /// so `flag --list` etc. don't blow up on missing data.
+    #[serde(default)]
+    pub variants: PackageVariants,
 }
 
 /// Latest-build summary embedded in a package.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct LatestBuildDto {
     pub id: i64,
     pub status: String,
     pub pkg_version: Option<String>,
     pub finished_at: Option<i64>,
     pub exit_code: Option<i64>,
+    /// Which variant this build produced. "default" for builds
+    /// predating the variants migration.
+    #[serde(default = "default_build_variant")]
+    pub variant: String,
+}
+
+fn default_build_variant() -> String {
+    "default".to_string()
 }
 
 /// Build DTO mirroring the daemon's response.
@@ -290,6 +333,10 @@ pub struct BuildDto {
     pub pkg_version: Option<String>,
     pub worker_id: Option<String>,
     pub trigger: String,
+    /// Which variant this build produced. "default" for builds
+    /// predating the variants migration.
+    #[serde(default = "default_build_variant")]
+    pub variant: String,
 }
 
 /// Queue DTO from `/api/v1/queue`.

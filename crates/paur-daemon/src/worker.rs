@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use paur_builder::{BuildOutcome, BuildRequest, LogSink};
+use paur_core::Variant;
 use paur_db::{BuildStatus, Stream};
 use paur_repo::RepoCtx;
 use tokio::sync::{broadcast, Mutex};
@@ -135,7 +136,7 @@ pub async fn run(state: AppState, max_workers: u32) -> Result<(), paur_core::Err
         tokio::spawn(async move {
             if let Ok(rows) = st
                 .db
-                .list_builds(None, Some(BuildStatus::Queued), 10_000)
+                .list_builds(None, Some(BuildStatus::Queued), None, 10_000)
                 .await
             {
                 for b in rows {
@@ -203,6 +204,14 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
     let sink = DbLogSink::new(state.clone(), build.id);
     let sink: Arc<dyn LogSink> = Arc::new(sink);
 
+    // Translate the DB-stored variant string into the worker's enum.
+    let variant = Variant::parse(&build.variant).ok_or_else(|| {
+        paur_core::Error::Invalid(format!(
+            "build {} has unknown variant tag: {:?}",
+            build.id, build.variant
+        ))
+    })?;
+
     // Build a BuildRequest and run it.
     let req = BuildRequest {
         pkg: pkg_name.clone(),
@@ -212,6 +221,7 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
         runtime: state.cfg.container_runtime,
         image: state.cfg.builder_image.clone(),
         flags: pkg.build_flags.clone(),
+        variant,
     };
     let outcome = paur_builder::run_in_container(&req, Arc::clone(&sink)).await?;
 
@@ -229,7 +239,7 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
     if final_status == BuildStatus::Success {
         // Move artifacts into the repo and sign. We use the on-disk
         // paths the builder produced (under work_dir/out).
-        match publish_artifacts(state, &pkg_name, &req.work_dir.join("out"), &outcome).await {
+        match publish_artifacts(state, &pkg_name, &req.work_dir.join("out"), &outcome, variant).await {
             Ok(_) => {
                 let pkg_file = outcome
                     .pkg_files
@@ -292,6 +302,7 @@ async fn publish_artifacts(
     _pkg: &paur_core::PkgName,
     out_dir: &std::path::Path,
     outcome: &BuildOutcome,
+    variant: Variant,
 ) -> Result<(), paur_core::Error> {
     // The builder returned relative paths under work_dir/out; resolve
     // them so the repo gets the real files.
@@ -306,7 +317,7 @@ async fn publish_artifacts(
             }
         })
         .collect();
-    paur_repo::publish(&state.repo, &pkg_files).await?;
+    paur_repo::publish(&state.repo, &pkg_files, variant).await?;
     Ok(())
 }
 
@@ -332,11 +343,21 @@ struct DbLogSink {
 /// re-export, we just do it ourselves at startup whenever the
 /// file is missing. Re-exporting is cheap and the key material
 /// is already on disk in `cfg.gpg_home`.
+/// Make sure `<arch_dir>/paur.pubkey.asc` is on disk for every
+/// variant's arch subdir, and matches the GPG key id stored in
+/// the `settings` table. These files are what the install page's
+/// "Resolve FPR" button and the `paur-keyring` meta-package
+/// both read, so their absence is user-visible.
+///
+/// `paur-cli init` is what *should* keep these files in sync, but
+/// it has no reason to run on a normal daemon restart — and an
+/// operator who runs `rsync --delete` against `<data_dir>/repo/`
+/// (with the wrong source) can wipe them without the daemon ever
+/// noticing. Rather than ask the operator to remember to
+/// re-export, we just do it ourselves at startup whenever a
+/// file is missing. Re-exporting is cheap and the key material
+/// is already on disk in `cfg.gpg_home`.
 async fn ensure_served_pubkey(state: &AppState) -> Result<(), paur_core::Error> {
-    let pubkey_path: PathBuf = state.repo.arch_dir().join("paur.pubkey.asc");
-    if pubkey_path.exists() {
-        return Ok(());
-    }
     let keyid = state
         .db
         .get_setting("gpg_key_id")
@@ -351,8 +372,25 @@ async fn ensure_served_pubkey(state: &AppState) -> Result<(), paur_core::Error> 
             "gpg_key_id in settings is empty; run `paur-cli init`".into(),
         ));
     }
-    paur_repo::export_pubkey(&state.cfg.gpg_home, &keyid, &pubkey_path).await?;
-    tracing::info!(?pubkey_path, %keyid, "self-healed served pubkey");
+    for variant in Variant::all() {
+        let pubkey_path: PathBuf = state.repo.arch_subdir(*variant).join("paur.pubkey.asc");
+        if pubkey_path.exists() {
+            continue;
+        }
+        // Make sure the parent arch subdir exists; on a fresh
+        // host the x86_64-v3 / x86_64-v4 dirs may not have been
+        // created yet.
+        if let Some(parent) = pubkey_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                paur_core::Error::Repo(format!(
+                    "create_dir_all {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        paur_repo::export_pubkey(&state.cfg.gpg_home, &keyid, &pubkey_path).await?;
+        tracing::info!(?pubkey_path, %keyid, variant = variant.as_str(), "self-healed served pubkey");
+    }
     Ok(())
 }
 

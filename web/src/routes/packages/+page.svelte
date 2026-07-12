@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api, ApiError, fmtTs, type Package } from '$lib/api';
+  import { api, ApiError, fmtTs, type Package, type Variant } from '$lib/api';
   import { authState } from '$lib/auth';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
+  import VariantBadge from '$lib/components/VariantBadge.svelte';
   import DeploymentTable from '$lib/components/DeploymentTable.svelte';
 
   let pkgs = $state<Package[]>([]);
@@ -12,8 +13,21 @@
 
   let newName = $state('');
   let newAutoRebuild = $state(false);
+  // Variant toggles for the Add form. `default` is invariant and
+  // not shown — it's always on, the daemon enforces it. Only v3
+  // and v4 are user-controllable here; the actual selected
+  // Variant[] sent to the API derives from these booleans.
+  let newVariantV3 = $state(false);
+  let newVariantV4 = $state(false);
   let submitting = $state(false);
   let submitError = $state<string | null>(null);
+
+  function selectedVariants(): Variant[] {
+    const v: Variant[] = [];
+    if (newVariantV3) v.push('v3');
+    if (newVariantV4) v.push('v4');
+    return v;
+  }
 
   onMount(refresh);
 
@@ -42,9 +56,11 @@
     submitting = true;
     submitError = null;
     try {
-      await api.addPackage(newName.trim(), newAutoRebuild);
+      await api.addPackage(newName.trim(), newAutoRebuild, selectedVariants());
       newName = '';
       newAutoRebuild = false;
+      newVariantV3 = false;
+      newVariantV4 = false;
       await refresh();
     } catch (err) {
       if (!maybeRedirectToLogin(err)) {
@@ -78,9 +94,23 @@
     }
   }
 
+  // Per-package view of the active variant set. Daemons predating
+  // the variants migration don't include the field; render
+  // default-only in that case.
+  function activeVariants(p: Package): Variant[] {
+    const v = p.variants;
+    if (!v) return ['default'];
+    const out: Variant[] = [];
+    if (v.default) out.push('default');
+    if (v.v3) out.push('v3');
+    if (v.v4) out.push('v4');
+    return out;
+  }
+
   const columns = [
     { key: 'name', label: 'Package' },
     { key: 'auto', label: 'Auto', class: 'w-20' },
+    { key: 'variants', label: 'Variants', class: 'w-40' },
     { key: 'latest', label: 'Latest', class: 'w-28' },
     { key: 'version', label: 'Version', class: 'w-48' },
     { key: 'finished', label: 'Finished', class: 'w-40' },
@@ -108,6 +138,28 @@
       <input type="checkbox" bind:checked={newAutoRebuild} class="rounded" />
       auto-rebuild on AUR HEAD change
     </label>
+    <div class="inline-flex items-center gap-3 text-sm" style="color: var(--body);">
+      <span class="text-xs" style="color: var(--mute);">Variants:</span>
+      <span
+        class="inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-mono"
+        style="background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.35); color: rgb(203, 213, 225);"
+        title="default is always on"
+      >default</span>
+      <label class="inline-flex items-center gap-1.5">
+        <input type="checkbox" bind:checked={newVariantV3} class="rounded" />
+        <span
+          class="rounded-md border px-1.5 py-0.5 text-[10px] font-mono"
+          style="background: rgba(245, 158, 11, 0.12); border-color: rgba(245, 158, 11, 0.35); color: rgb(252, 211, 77);"
+        >v3</span>
+      </label>
+      <label class="inline-flex items-center gap-1.5">
+        <input type="checkbox" bind:checked={newVariantV4} class="rounded" />
+        <span
+          class="rounded-md border px-1.5 py-0.5 text-[10px] font-mono"
+          style="background: rgba(168, 85, 247, 0.12); border-color: rgba(168, 85, 247, 0.35); color: rgb(216, 180, 254);"
+        >v4</span>
+      </label>
+    </div>
     <button class="btn btn-primary" type="submit" disabled={submitting}>
       {submitting ? 'Adding…' : 'Add + build'}
     </button>
@@ -138,6 +190,13 @@
           <div class="text-xs" style="color: var(--mute);">{p.aur_url}</div>
         </td>
         <td style="color: var(--body);">{p.auto_rebuild ? 'yes' : 'no'}</td>
+        <td>
+          <div class="flex flex-wrap gap-1">
+            {#each activeVariants(p) as v (v)}
+              <VariantBadge variant={v} />
+            {/each}
+          </div>
+        </td>
         <td>
           {#if p.latest_build}
             <StatusBadge status={p.latest_build.status} />

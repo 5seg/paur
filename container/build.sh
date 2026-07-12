@@ -3,18 +3,20 @@
 # Build an AUR package inside the paur-builder container.
 #
 # Usage:
-#   build.sh <pkg-name> <aur-url>      # AUR path
-#   build.sh local                      # local PKGBUILD path
-#   build.sh repo <db.tar.gz> <pkg...>  # repo-add: register the listed
-#                                        # .pkg.tar.* files into the DB
-#   build.sh unrepo <db.tar.gz> <name>  # repo-remove: drop a package
+#   build.sh <pkg-name> <aur-url>        # AUR path
+#   build.sh local                        # local PKGBUILD path
+#   build.sh repo <db.tar.gz> <arch-dir> <pkg...>   # repo-add for a variant
+#   build.sh unrepo <db.tar.gz> <arch-dir> <name>   # repo-remove
 #
 # Layout (host bind-mounts):
 #   /work/src   -- freshly cloned AUR repo (or local PKGBUILD dir in
 #                  `local` mode, bind-mounted read-only)
 #   /work/out   -- resulting .pkg.tar.* files (moved here on success)
 #   /work/repo  -- the architecture-specific pacman repo directory
-#                  (only mounted for `repo` and `unrepo` modes)
+#                  for one variant (default, v3, or v4). The host
+#                  passes the absolute path as the second positional
+#                  arg to `repo` / `unrepo` so the same image can
+#                  target any of the three arch subdirs.
 #   /ccache     -- ccache dir (persistent across builds on the host)
 #
 # The script intentionally uses `set -euo pipefail
@@ -197,15 +199,16 @@ move_artifacts() {
 # Example: build.sh repo paur.db.tar.gz /work/stage/openclaude-*.pkg.tar.zst
 build_repo() {
     local db_name="$1"; shift
-    if [[ -z "${db_name}" || $# -lt 1 ]]; then
-        echo "==> paur: usage: build.sh repo <db.tar.gz> <pkg...>" >&2
+    local arch_dir="$1"; shift
+    if [[ -z "${db_name}" || -z "${arch_dir}" || $# -lt 1 ]]; then
+        echo "==> paur: usage: build.sh repo <db.tar.gz> <arch_dir> <pkg...>" >&2
         exit 2
     fi
-    if [[ ! -d /work/repo ]]; then
-        echo "==> paur: /work/repo is not mounted" >&2
+    if [[ ! -d "${arch_dir}" ]]; then
+        echo "==> paur: arch_dir ${arch_dir} is not a directory" >&2
         exit 2
     fi
-    cd /work/repo
+    cd "${arch_dir}"
     # repo-add expects the .db.tar.gz suffix on its first positional
     # argument; the .db and .files tarballs it creates share the
     # basename. Pre-existing .sig is removed because the DB content
@@ -222,15 +225,16 @@ build_repo() {
 # Args: <db.tar.gz name> <pkgname>
 build_unrepo() {
     local db_name="$1"; shift
-    if [[ -z "${db_name}" || $# -ne 1 ]]; then
-        echo "==> paur: usage: build.sh unrepo <db.tar.gz> <pkgname>" >&2
+    local arch_dir="$1"; shift
+    if [[ -z "${db_name}" || -z "${arch_dir}" || $# -ne 1 ]]; then
+        echo "==> paur: usage: build.sh unrepo <db.tar.gz> <arch_dir> <pkgname>" >&2
         exit 2
     fi
-    if [[ ! -d /work/repo ]]; then
-        echo "==> paur: /work/repo is not mounted" >&2
+    if [[ ! -d "${arch_dir}" ]]; then
+        echo "==> paur: arch_dir ${arch_dir} is not a directory" >&2
         exit 2
     fi
-    cd /work/repo
+    cd "${arch_dir}"
     rm -f "${db_name}.sig"
     repo-remove "${db_name}" "$1"
     echo "==> paur: repo-remove dropped $1 from ${db_name}"

@@ -10,6 +10,26 @@ export type BuildStatus =
   | 'failed'
   | 'cancelled';
 
+/// Build variants. The string form is the same one used in the
+/// daemon's DB column, the `paur-mirrorlist` Server lines, and
+/// the `repo/x86_64$variant` URL fragment. `default` is the
+/// plain x86-64 build; `v3` / `v4` are the CachyOS-style
+/// `-march=x86-64-vN` builds.
+export type Variant = 'default' | 'v3' | 'v4';
+
+/// Per-package active variant set. `default` is always true —
+/// the daemon enforces this — so the UI renders it as a
+/// disabled checkbox and only the v3 / v4 toggles are user-
+/// controllable. Older daemons that predate the variants
+/// migration omit this; the field defaults to `{ default:
+/// true, v3: false, v4: false }` so toggles render in their
+/// "off" state.
+export interface PackageVariants {
+  default: boolean;
+  v3: boolean;
+  v4: boolean;
+}
+
 export interface LatestBuild {
   id: number;
   /** 1-based per-package sequence number; preferred for UI labels. */
@@ -18,6 +38,9 @@ export interface LatestBuild {
   pkg_version: string | null;
   finished_at: number | null;
   exit_code: number | null;
+  /// Which variant this build produced. "default" for builds
+  /// predating the variants migration.
+  variant: Variant;
 }
 
 export interface PackageBuildFlags {
@@ -49,6 +72,11 @@ export interface Package {
    * falls back to all-false so toggles render in their "off" state.
    */
   build_flags?: PackageBuildFlags;
+  /**
+   * Per-package active variant set. Older daemons (<0.x with
+   * variants) omit this; the UI falls back to `default`-only.
+   */
+  variants?: PackageVariants;
 }
 
 export interface Build {
@@ -65,6 +93,9 @@ export interface Build {
   pkg_version: string | null;
   worker_id: string | null;
   trigger: string;
+  /// Which variant this build produced. "default" for builds
+  /// predating the variants migration.
+  variant: Variant;
 }
 
 export interface Queue {
@@ -136,8 +167,15 @@ export const api = {
   health: () => getJson<string>('/api/v1/health'),
   listPackages: () => getJson<Package[]>('/api/v1/packages'),
   getPackage: (name: string) => getJson<Package>(`/api/v1/packages/${name}`),
-  addPackage: (name: string, auto_rebuild: boolean) =>
-    sendJson<Package>('POST', '/api/v1/packages', { name, auto_rebuild }),
+  addPackage: (
+    name: string,
+    auto_rebuild: boolean,
+    variants: Variant[] = []
+  ) => sendJson<Package>('POST', '/api/v1/packages', {
+    name,
+    auto_rebuild,
+    variants
+  }),
   removePackage: (name: string) =>
     sendJson<void>('DELETE', `/api/v1/packages/${name}`),
   rebuildPackage: (name: string) =>
@@ -151,6 +189,13 @@ export const api = {
    */
   setBuildFlags: (name: string, patch: Partial<PackageBuildFlags>) =>
     sendJson<Package>('PATCH', `/api/v1/packages/${name}/flags`, patch),
+  /// Replace the active variant set for a package. The daemon
+  /// forces `default` on regardless of what's passed, so the
+  /// caller may omit it. An empty array means "default only".
+  setVariants: (name: string, variants: Variant[]) =>
+    sendJson<Package>('PATCH', `/api/v1/packages/${name}/variants`, {
+      variants
+    }),
   listBuilds: (opts: { pkg?: string; status?: string; limit?: number } = {}) => {
     const qs = new URLSearchParams();
     if (opts.pkg) qs.set('pkg', opts.pkg);

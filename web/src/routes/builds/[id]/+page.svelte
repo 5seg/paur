@@ -3,6 +3,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { api, fmtTs, streamLogs, type Build } from '$lib/api';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
+  import VariantBadge from '$lib/components/VariantBadge.svelte';
 
   let id = $derived(Number($page.params.id));
   let build = $state<Build | null>(null);
@@ -73,6 +74,7 @@
   </h1>
   {#if build}
     <StatusBadge status={build.status} />
+    <VariantBadge variant={build.variant} size="md" />
     <span class="text-sm" style="color: var(--mute);">trigger: {build.trigger}</span>
   {/if}
   <div class="ml-auto flex items-center gap-3">
@@ -116,6 +118,10 @@
     <div>
       <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">file</div>
       <div class="font-mono" style="color: var(--body);">{build.pkg_file ?? '—'}</div>
+    </div>
+    <div>
+      <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">variant</div>
+      <div><VariantBadge variant={build.variant} size="md" /></div>
     </div>
     <div>
       <div class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--mute);">worker</div>

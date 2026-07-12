@@ -170,7 +170,7 @@ async fn run_cleanup_work(
 
     // Collect live build ids so we can skip their work dirs.
     let running = db
-        .list_builds(None, Some(paur_db::BuildStatus::Running), 10_000)
+        .list_builds(None, Some(paur_db::BuildStatus::Running), None, 10_000)
         .await?;
     let live: std::collections::HashSet<i64> = running.into_iter().map(|b| b.id).collect();
 

@@ -14,7 +14,7 @@ pub mod logging;
 pub mod name;
 pub mod paths;
 
-pub use build_flags::{MarchLevel, PackageBuildFlags};
+pub use build_flags::{PackageBuildFlags, PackageVariants, Variant};
 pub use config::{Config, ContainerRuntime, Listen, S3Config};
 pub use error::{Error, Result};
 pub use name::PkgName;

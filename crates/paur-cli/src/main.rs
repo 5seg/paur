@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use paur_cli::{client::DaemonClient, cmd};
-use paur_core::Config;
+use paur_core::{Config, Variant};
 
 #[derive(Parser, Debug)]
 #[command(name = "paur-cli", about = "CLI front-end for the paur pre-build service", version)]
@@ -34,13 +34,20 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Add a package and enqueue its first build.
+    /// Add a package and enqueue its first build. The default
+    /// variant is always built; `--variant` is repeatable and adds
+    /// v3 / v4 builds on top.
     Add {
         /// Package name (AUR base name, e.g. `paru-bin`).
         name: String,
         /// Mark this package for automatic rebuild on AUR HEAD change.
         #[arg(long)]
         auto_rebuild: bool,
+        /// Repeatable. Adds the named variant (`v3` or `v4`) to
+        /// the active set. `default` is implicit and cannot be
+        /// passed here.
+        #[arg(long = "variant", value_parser = parse_variant_arg)]
+        variant: Vec<Variant>,
     },
     /// Remove a package from paur.
     Remove {
@@ -70,15 +77,11 @@ enum Cmd {
         /// Package name.
         name: String,
     },
-    /// Read or update per-package build tuning flags (memory/CPU
-    /// countermeasures for OOM-prone packages). With no flags, prints
-    /// the current values.
+    /// Read or update per-package build tuning flags and active
+    /// variants. With no flags, prints the current values.
     Flag {
         /// Package name.
         name: String,
-        /// Show current flags without modifying them.
-        #[arg(long)]
-        list: bool,
         /// Cap parallel make jobs to `-j2` to cut peak RAM.
         #[arg(long, value_parser = parse_on_off)]
         low_memory: Option<bool>,
@@ -88,11 +91,11 @@ enum Cmd {
         /// Skip ccache bind mount for this package.
         #[arg(long, value_parser = parse_on_off)]
         no_ccache: Option<bool>,
-        /// x86-64 microarchitecture level: `v3`, `v4`, or `none` to
-        /// clear. Replaces CFLAGS with CachyOS-style
-        /// `-march=x86-64-vN -O2 -pipe -fno-plt`.
-        #[arg(long)]
-        march: Option<String>,
+        /// Toggle one of the package's variants. Repeatable.
+        /// Each occurrence flips the named variant (on → off or
+        /// off → on). `default` is invariant and rejected.
+        #[arg(long = "variant", value_parser = parse_variant_arg)]
+        variant: Vec<Variant>,
     },
     /// Show the current queue and running builds.
     Queue,
@@ -169,9 +172,13 @@ async fn main() {
 
 async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
     match cli.cmd {
-        Cmd::Add { name, auto_rebuild } => {
+        Cmd::Add {
+            name,
+            auto_rebuild,
+            variant,
+        } => {
             let c = client(&cfg, cli.api.as_deref());
-            cmd::add(&c, &name, auto_rebuild).await
+            cmd::add(&c, &name, auto_rebuild, &variant).await
         }
         Cmd::Remove { name } => {
             let c = client(&cfg, cli.api.as_deref());
@@ -195,14 +202,21 @@ async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
         }
         Cmd::Flag {
             name,
-            list,
             low_memory,
             rust_codegen_units_1,
             no_ccache,
-            march,
+            variant,
         } => {
             let c = client(&cfg, cli.api.as_deref());
-            cmd::flag(&c, &name, list, low_memory, rust_codegen_units_1, no_ccache, march).await
+            cmd::flag(
+                &c,
+                &name,
+                low_memory,
+                rust_codegen_units_1,
+                no_ccache,
+                &variant,
+            )
+            .await
         }
         Cmd::Queue => {
             let c = client(&cfg, cli.api.as_deref());
@@ -269,6 +283,19 @@ fn parse_on_off(s: &str) -> Result<bool, String> {
         other => Err(format!(
             "expected on/off (got {other:?}); use --list to view current values"
         )),
+    }
+}
+
+/// Parse a `--variant` argument. Accepts `v3` / `v4` (case
+/// insensitive). `default` is rejected because the daemon
+/// enforces it as an invariant and silently dropping it would
+/// confuse the user.
+fn parse_variant_arg(s: &str) -> Result<Variant, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "v3" => Ok(Variant::V3),
+        "v4" => Ok(Variant::V4),
+        "default" => Err("default is always on; cannot be set explicitly".into()),
+        other => Err(format!("expected v3|v4 (got {other:?})")),
     }
 }
 

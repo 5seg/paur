@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 
-use paur_core::{Config, PkgName};
+use paur_core::{Config, PackageVariants, PkgName, Variant};
 use paur_db::Db;
 use paur_repo;
 
@@ -44,15 +44,26 @@ impl CmdError {
     }
 }
 
-/// `paur-cli add <pkg> [--auto-rebuild]`
+/// `paur-cli add <pkg> [--auto-rebuild] [--variant v3] [--variant v4]`
+///
+/// `default` is always on; `--variant` is repeatable and turns on
+/// v3 / v4 builds on top. The daemon enqueues one build per
+/// active variant.
 pub async fn add(
     client: &DaemonClient,
     pkg: &str,
     auto_rebuild: bool,
+    variants: &[Variant],
 ) -> Result<(), CmdError> {
     let name = PkgName::new(pkg)?;
-    let dto = client.add_package(name.as_str(), auto_rebuild).await?;
-    println!("added {} (id={}, auto_rebuild={})", dto.name, dto.id, dto.auto_rebuild);
+    let dto = client
+        .add_package(name.as_str(), auto_rebuild, variants)
+        .await?;
+    println!(
+        "added {} (id={}, auto_rebuild={})",
+        dto.name, dto.id, dto.auto_rebuild
+    );
+    println!("variants: {}", format_variants(&dto.variants));
     Ok(())
 }
 
@@ -71,7 +82,7 @@ pub async fn list(client: &DaemonClient) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// `paur-cli status <pkg>` — package + its latest build.
+/// `paur-cli status <pkg>` — package + its latest build per variant.
 pub async fn status(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     let name = PkgName::new(pkg)?;
     let p = client.get_package(name.as_str()).await?;
@@ -80,18 +91,53 @@ pub async fn status(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     println!("aur_url:     {}", p.aur_url);
     println!("auto_rebuild: {}", p.auto_rebuild);
     println!("last_ref:    {}", p.last_known_ref.as_deref().unwrap_or("-"));
-    match p.latest_build {
-        Some(b) => {
-            println!("latest_build:");
-            println!("  id:        {}", b.id);
-            println!("  status:    {}", b.status);
-            println!("  version:   {}", b.pkg_version.as_deref().unwrap_or("-"));
-            println!("  exit:      {}", b.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into()));
-            println!("  finished:  {}", output::fmt_ts(b.finished_at));
+    println!("variants:    {}", format_variants(&p.variants));
+
+    // Iterate active variants in canonical order. For each, find
+    // the most recent build row. The daemon's `latest_build` on
+    // the package DTO is the latest across all variants, which
+    // isn't what we want here — we want a per-variant view.
+    for v in p.variants.active() {
+        let builds = client
+            .list_builds(Some(name.as_str()), None, Some(50))
+            .await?;
+        let latest = builds.iter().find(|b| b.variant == v.as_str());
+        match latest {
+            Some(b) => {
+                println!("latest_build [{}]:", v);
+                println!("  id:        {}", b.id);
+                println!("  status:    {}", b.status);
+                println!(
+                    "  version:   {}",
+                    b.pkg_version.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  exit:      {}",
+                    b.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+                );
+                println!("  finished:  {}", output::fmt_ts(b.finished_at));
+            }
+            None => println!("latest_build [{}]: (none yet)", v),
         }
-        None => println!("latest_build: (none)"),
     }
     Ok(())
+}
+
+/// Render a `PackageVariants` as the active variant names joined
+/// with `, ` (e.g. `default, v3`). Used by `add` / `status` / `flag`
+/// output. Inactive variants are omitted.
+fn format_variants(v: &PackageVariants) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if v.default {
+        parts.push("default");
+    }
+    if v.v3 {
+        parts.push("v3");
+    }
+    if v.v4 {
+        parts.push("v4");
+    }
+    parts.join(", ")
 }
 
 /// `paur-cli logs <pkg> [--build N] [--follow]`
@@ -206,93 +252,118 @@ pub async fn rebuild(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// `paur-cli flag <pkg> --list | --low-memory on|off [--rust-codegen-units-1 on|off] [--no-ccache on|off] [--march v3|v4|none]`
+/// `paur-cli flag <pkg> [--variant v3] [--variant v4]`
 ///
-/// Per-package build tuning flags (memory/CPU countermeasures). The
-/// daemon composes them in a fixed order:
+/// Per-package build tuning flags (memory/CPU countermeasures) and
+/// variant toggles. Without any flags, prints the current state.
 ///
+/// Behavior matrix:
+/// - `flag <pkg>`                  → print current flags + variants
+/// - `flag <pkg> --variant v3`     → toggle v3 (on → off, off → on)
+/// - `flag <pkg> --low-memory on`  → set low_memory on
+/// - `flag <pkg> --low-memory off` → set low_memory off
+///
+/// The build-tuning flags (`low_memory`, `rust_codegen_units_1`,
+/// `no_ccache`) are independent; omitting one leaves it unchanged.
+/// `--variant` is repeatable and toggles per-call: passing `--variant
+/// v3` on a package that already has v3 turns it off.
+///
+/// The daemon composes the build-tuning flags in this order at
+/// build time:
 /// - `low_memory`             → `MAKEFLAGS=-j2`
 /// - `rust_codegen_units_1`   → appends `-C codegen-units=1` to `RUSTFLAGS`
 /// - `no_ccache`              → skips the ccache bind mount
-/// - `march`                  → CachyOS-style `-march=x86-64-vN`
-///                               CFLAGS / CXXFLAGS / RUSTFLAGS override
 ///
-/// All flags are independent; omitting a flag leaves it unchanged.
-/// `--list` is a read-only path that hits the same `get_package`
-/// endpoint and prints the current state.
+/// The variant choice (`default` / `v3` / `v4`) is independent of
+/// the build-tuning flags — it controls which compiled `.pkg.tar.*`
+/// gets built and where it gets published. `default` is always on
+/// and cannot be turned off.
 pub async fn flag(
     client: &DaemonClient,
     pkg: &str,
-    list: bool,
     low_memory: Option<bool>,
     rust_codegen_units_1: Option<bool>,
     no_ccache: Option<bool>,
-    march: Option<String>,
+    variants: &[Variant],
 ) -> Result<(), CmdError> {
     let name = PkgName::new(pkg)?;
-    // Parse the --march value into the nested-Option shape the
-    // inner code expects. None (outer) = flag omitted (no-op);
-    // Some(None) = explicit "clear march"; Some(Some(level)) = set.
-    let march: Option<Option<paur_core::MarchLevel>> = match march {
-        None => None,
-        Some(s) => Some(parse_march_arg(&s).map_err(CmdError::Other)?),
-    };
-    // `list` is now handled by `paur-cli get`; we keep the legacy
-    // flag here for back-compat. If no toggle flags were passed
-    // either way, we just print the current state.
-    if list
-        || (low_memory.is_none()
-            && rust_codegen_units_1.is_none()
-            && no_ccache.is_none()
-            && march.is_none())
+
+    // If no toggles were passed, just print the current state.
+    if low_memory.is_none()
+        && rust_codegen_units_1.is_none()
+        && no_ccache.is_none()
+        && variants.is_empty()
     {
         let p = client.get_package(name.as_str()).await?;
-        println!("name:                {}", p.name);
-        println!("low_memory:          {}", p.build_flags.low_memory);
-        println!("rust_codegen_units_1: {}", p.build_flags.rust_codegen_units_1);
-        println!("no_ccache:           {}", p.build_flags.no_ccache);
-        let m = p.build_flags.march.map(|l| l.as_str()).unwrap_or("default");
-        println!("march:               {m}");
+        println!("name:                 {}", p.name);
+        println!("low_memory:           {}", p.build_flags.low_memory);
+        println!(
+            "rust_codegen_units_1: {}",
+            p.build_flags.rust_codegen_units_1
+        );
+        println!("no_ccache:            {}", p.build_flags.no_ccache);
+        println!("variants:             {}", format_variants(&p.variants));
         return Ok(());
     }
 
-    // The PATCH /flags endpoint takes a *full* desired state, not
-    // a partial patch. Read the current flags, apply the
-    // user-provided overrides, and send the merged result. This
-    // matches the WebUI's behaviour and lets the CLI explicitly
-    // turn a flag off (`paur-cli flag <pkg> --low-memory false`)
-    // or clear the march level (`paur-cli flag <pkg> --march none`).
+    // Read-modify-write for both the build flags and the variant
+    // set. Each PATCH endpoint takes a *full* desired state, so
+    // we fetch the current value, apply the user overrides, and
+    // send the merged result.
     let current = client.get_package(name.as_str()).await?;
-    let mut update = current.build_flags;
+    let mut updated_flags = current.build_flags.clone();
     if let Some(v) = low_memory {
-        update.low_memory = v;
+        updated_flags.low_memory = v;
     }
     if let Some(v) = rust_codegen_units_1 {
-        update.rust_codegen_units_1 = v;
+        updated_flags.rust_codegen_units_1 = v;
     }
     if let Some(v) = no_ccache {
-        update.no_ccache = v;
+        updated_flags.no_ccache = v;
     }
-    if let Some(v) = march {
-        update.march = v;
-    }
-    let updated = client.set_build_flags(name.as_str(), &update).await?;
-    println!("{} flags updated:", updated.name);
-    println!("  low_memory:           {}", updated.build_flags.low_memory);
-    println!("  rust_codegen_units_1: {}", updated.build_flags.rust_codegen_units_1);
-    println!("  no_ccache:            {}", updated.build_flags.no_ccache);
-    let m = updated.build_flags.march.map(|l| l.as_str()).unwrap_or("default");
-    println!("  march:                {m}");
-    Ok(())
-}
 
-fn parse_march_arg(s: &str) -> Result<Option<paur_core::MarchLevel>, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "v3" => Ok(Some(paur_core::MarchLevel::V3)),
-        "v4" => Ok(Some(paur_core::MarchLevel::V4)),
-        "none" | "off" | "default" | "" => Ok(None),
-        other => Err(format!("expected v3|v4|none (got {other:?})")),
+    // For variants, compute the new active set by toggling each
+    // --variant the user passed. `Default` is a no-op (it can't be
+    // turned off).
+    let mut updated_variants = current.variants;
+    for v in variants {
+        if updated_variants.is_active(*v) {
+            updated_variants.turn_off(*v);
+        } else {
+            updated_variants.turn_on(*v);
+        }
     }
+
+    // Only PATCH the endpoint that actually changed, to keep the
+    // log line and the response minimal.
+    let flags_changed = updated_flags != current.build_flags;
+    let variants_changed = updated_variants != current.variants;
+    let final_dto = if flags_changed {
+        client
+            .set_build_flags(name.as_str(), &updated_flags)
+            .await?
+    } else {
+        // No flag changes — fall through to the variants PATCH
+        // (or use the current dto if neither changed).
+        current.clone()
+    };
+    let final_dto = if variants_changed {
+        client
+            .set_variants(name.as_str(), &updated_variants.active())
+            .await?
+    } else {
+        final_dto
+    };
+
+    println!("{} flags updated:", final_dto.name);
+    println!("  low_memory:           {}", final_dto.build_flags.low_memory);
+    println!(
+        "  rust_codegen_units_1: {}",
+        final_dto.build_flags.rust_codegen_units_1
+    );
+    println!("  no_ccache:            {}", final_dto.build_flags.no_ccache);
+    println!("  variants:             {}", format_variants(&final_dto.variants));
+    Ok(())
 }
 
 /// `paur-cli pubkey` — fetch and print the GPG pubkey.
@@ -513,18 +584,41 @@ pub fn _validate_name(p: &Path) -> Result<(), CmdError> {
 
 /// `paur-cli print-pacman-conf` — emit the lines a client should
 /// append to `/etc/pacman.conf`. Doesn't need a daemon.
+///
+/// As of the variants migration paur publishes to three arch
+/// variants (`x86_64` / `x86_64-v3` / `x86_64-v4`). The simplest
+/// setup pulls all three from a single `[paur]` section via the
+/// `paur-mirrorlist` Include — pacman matches the right Server
+/// line by `$arch` expansion. The three explicit sections are
+/// also printed for clients that prefer to toggle the v3 / v4
+/// sections individually.
 pub fn print_pacman_conf(cfg: &Config) {
+    let repo = &cfg.repo_name;
     println!("# paur: add these lines to /etc/pacman.conf");
-    println!("[{}]", cfg.repo_name);
+    println!("# (option 1 — single section, mirrorlist include)");
+    println!("[{repo}]");
     println!("SigLevel = Optional TrustedOnly");
-    println!("Include = /etc/pacman.d/{}-mirrorlist", cfg.repo_name);
+    println!("Include = /etc/pacman.d/{repo}-mirrorlist");
+    println!();
+    println!("# (option 2 — three sections, each opt-in)");
+    println!("[{repo}]");
+    println!("SigLevel = Optional TrustedOnly");
+    println!("Include = /etc/pacman.d/{repo}-mirrorlist");
+    println!();
+    println!("[{repo}-v3]");
+    println!("SigLevel = Optional TrustedOnly");
+    println!("Include = /etc/pacman.d/{repo}-mirrorlist");
+    println!();
+    println!("[{repo}-v4]");
+    println!("SigLevel = Optional TrustedOnly");
+    println!("Include = /etc/pacman.d/{repo}-mirrorlist");
     println!();
     println!("# The [paur] repo entry pulls the mirror URL from the package");
     println!("# installed by `paur-cli keyring-build`:");
     println!("#   sudo pacman -U <URL of {repo}-mirrorlist-*.pkg.tar.zst>",
-             repo = cfg.repo_name);
+             repo = repo);
     println!("#   sudo pacman -U <URL of {repo}-keyring-*.pkg.tar.zst>",
-             repo = cfg.repo_name);
+             repo = repo);
 }
 
 /// `paur-cli keyring-build` — build and publish the `paur-keyring`
@@ -553,16 +647,29 @@ pub async fn keyring_build(cfg: &Config) -> Result<(), CmdError> {
     let keyring_path = build_meta_package(cfg, "paur-keyring", &keyid).await?;
     let mirrorlist_path = build_meta_package(cfg, "paur-mirrorlist", &keyid).await?;
 
-    // Publish both. `paur_repo::publish` copies them into the repo
-    // arch dir, runs `repo-add`, and signs with the daemon's key.
+    // Publish both. `paur_repo::publish` copies them into the
+    // requested variant's arch dir, runs `repo-add`, and signs
+    // with the daemon's key. Both meta-packages belong in the
+    // default repo (the GPG key is shared across all three
+    // arch variants, so the `Include` in pacman.conf pulls the
+    // single keyring/mirrorlist from `[paur]` and applies to
+    // `[paur-v3]` / `[paur-v4]` as well).
     let repo = paur_daemon::build_repo_ctx(cfg, &db).await?;
-    let res1 = paur_repo::publish(&repo, std::slice::from_ref(&keyring_path))
-        .await
-        .map_err(|e| CmdError::Other(format!("publish paur-keyring: {e}")))?;
+    let res1 = paur_repo::publish(
+        &repo,
+        std::slice::from_ref(&keyring_path),
+        Variant::Default,
+    )
+    .await
+    .map_err(|e| CmdError::Other(format!("publish paur-keyring: {e}")))?;
     println!("published paur-keyring; db sig: {}", res1.display());
-    let res2 = paur_repo::publish(&repo, std::slice::from_ref(&mirrorlist_path))
-        .await
-        .map_err(|e| CmdError::Other(format!("publish paur-mirrorlist: {e}")))?;
+    let res2 = paur_repo::publish(
+        &repo,
+        std::slice::from_ref(&mirrorlist_path),
+        Variant::Default,
+    )
+    .await
+    .map_err(|e| CmdError::Other(format!("publish paur-mirrorlist: {e}")))?;
     println!("published paur-mirrorlist; db sig: {}", res2.display());
     // Keep the detached signatures for both meta-packages in
     // place. `pacman -U <URL>.pkg.tar.zst` always fetches
@@ -824,7 +931,7 @@ package() {{
 pkgname={repo_name}-mirrorlist
 pkgver=1
 pkgrel=1
-pkgdesc="Mirror list for the {repo_name} pacman repo"
+pkgdesc="Mirror list for the {repo_name} pacman repo (default + v3 + v4)"
 arch=('any')
 license=('GPL')
 backup=('etc/pacman.d/{repo_name}-mirrorlist')
@@ -840,9 +947,17 @@ package() {{
     # so pacman treats each line as a candidate Server URL.
     # `$arch` is expanded by pacman itself at sync time, the
     # same way it expands `$arch` in the system mirrorlist.
-    # We only ship one Server line — a personal repo has a
-    # single endpoint — but the file format leaves room for
-    # more if a future deployer wants mirrors.
+    #
+    # As of the variants migration we ship three Server lines,
+    # one per arch variant (default / -v3 / -v4). All three
+    # come from the same endpoint; pacman picks the matching
+    # one by `$arch` expansion when it sees
+    # `Server = .../$arch` (default) vs `Server = .../$arch-v3`
+    # vs `Server = .../$arch-v4`. The 3 repos share a single
+    # GPG key (one `paur-keyring` install), so the
+    # `[paur-v3]` and `[paur-v4]` `[options]` Include pulls
+    # in the same trusted key automatically — pacman doesn't
+    # care which line a request matched on.
     cat > "$pkgdir/etc/pacman.d/{repo_name}-mirrorlist" <<EOF
 ## {repo_name} pacman repository
 ##
@@ -856,6 +971,8 @@ package() {{
 ## re-run `paur-cli keyring-build` to update.
 
 Server = {base_url}/repo/\$arch
+Server = {base_url}/repo/\$arch-v3
+Server = {base_url}/repo/\$arch-v4
 EOF
 }}
 "#
@@ -973,7 +1090,7 @@ mod tests {
         };
 
         // Add a package.
-        add(&client, "hello-pkg", false).await.expect("add");
+        add(&client, "hello-pkg", false, &[]).await.expect("add");
 
         // List should show it.
         let pkgs = client.list_packages().await.expect("list");
@@ -1068,6 +1185,11 @@ mod tests {
     /// Mirrorlist PKGBUILD embeds the configured `public_base_url`
     /// and the repo name into the package's mirrorlist file. The
     /// keyid is unused for the mirrorlist label; pass a dummy.
+    ///
+    /// As of the variants migration, the mirrorlist ships *three*
+    /// `Server =` lines (default / `-v3` / `-v4`) so the client
+    /// pacman.conf can `Include` it from a single `[paur]`
+    /// section and pull any of the three arch variants.
     #[test]
     fn write_pkgbuild_lays_out_mirrorlist() {
         let dir = tempdir().expect("tempdir");
@@ -1088,22 +1210,22 @@ mod tests {
                 .expect("read PKGBUILD");
         assert!(body.contains("pkgname=paur-mirrorlist"));
         assert!(body.contains("/etc/pacman.d/paur-mirrorlist"));
-        // Mirrorlist pkg installs a *mirror list* file (one
-        // `Server =` URL per line) referenced from pacman.conf
-        // via `Include = ...`. We must NOT ship a `[paur]`
-        // section header in the mirrorlist *file* (the PKGBUILD
-        // can mention it in comments), or pacman would
-        // double-register the database.
-        //
-        // Note: the PKGBUILD itself contains `\$arch` (an
-        // escaped `$` inside the unquoted heredoc) so bash
-        // writes a literal `$arch` to the mirrorlist file at
-        // install time, which pacman then expands.
-        assert!(body.contains("Server = https://paur.example/repo/\\$arch"));
-        // The mirrorlist *file* (the heredoc body, not the
-        // surrounding PKGBUILD comments) must not contain a
-        // section header. The heredoc is bounded by `<<EOF` /
-        // `EOF`; pull it out and assert on it alone.
+        // The PKGBUILD heredoc body must contain the three
+        // variant Server lines (default / -v3 / -v4). `$arch`
+        // is escaped in the unquoted heredoc so bash writes a
+        // literal `$arch` to the mirrorlist file at install
+        // time, which pacman then expands.
+        for tail in ["", "-v3", "-v4"] {
+            let needle = format!("Server = https://paur.example/repo/\\$arch{tail}");
+            assert!(
+                body.contains(&needle),
+                "mirrorlist missing server line for variant suffix {tail:?}: looking for {needle:?}"
+            );
+        }
+        // Pull the heredoc body out and assert on it alone: the
+        // file installed by the package (bounded by `<<EOF` /
+        // `EOF`) must not contain a section header on its own
+        // line. `[paur]` in `##` comments is fine.
         let heredoc_body = body
             .split("<<EOF")
             .nth(1)
@@ -1111,25 +1233,29 @@ mod tests {
             .split("\nEOF")
             .next()
             .expect("heredoc terminator present");
-        // The mirrorlist file must contain exactly one
-        // `Server = ...` line and no section header on its
-        // own line. (It can mention `[paur]` in `##`
-        // comments — pacman ignores those — but it must not
-        // *contain* a section header that would conflict
-        // with the section in pacman.conf and trigger
-        // "database already registered".)
         let server_lines: Vec<_> = heredoc_body
             .lines()
             .filter(|l| l.trim_start().starts_with("Server ="))
             .collect();
         assert_eq!(
             server_lines.len(),
-            1,
-            "mirrorlist must have exactly one Server = line"
+            3,
+            "mirrorlist must have exactly three Server = lines (default, v3, v4)"
         );
+        // First entry should be the default arch (no -vN suffix);
+        // the other two should target -v3 and -v4 respectively.
+        // Order matches the build chain.
         assert!(
             server_lines[0].contains("https://paur.example/repo/\\$arch"),
-            "Server URL should embed the configured base URL"
+            "default Server URL should embed the base URL (got: {:?})",
+            server_lines[0]
         );
+        assert!(
+            !server_lines[0].contains("-v3") && !server_lines[0].contains("-v4"),
+            "first Server line must be the default arch (got: {:?})",
+            server_lines[0]
+        );
+        assert!(server_lines[1].contains("https://paur.example/repo/\\$arch-v3"));
+        assert!(server_lines[2].contains("https://paur.example/repo/\\$arch-v4"));
     }
 }

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, fmtTs, type Queue, type Package, type Build } from '$lib/api';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
+  import VariantBadge from '$lib/components/VariantBadge.svelte';
   import DeploymentTable from '$lib/components/DeploymentTable.svelte';
 
   let queue = $state<Queue | null>(null);
@@ -31,6 +32,7 @@
   const columns = [
     { key: 'build', label: 'Build', class: 'w-24' },
     { key: 'package', label: 'Package' },
+    { key: 'variant', label: 'Variant', class: 'w-24' },
     { key: 'status', label: 'Status', class: 'w-28' },
     { key: 'trigger', label: 'Trigger', class: 'w-32' },
     { key: 'queued', label: 'Queued', class: 'w-40' }
@@ -64,6 +66,7 @@
             <a href="/builds/{b.id}" class="link-vercel">#{b.id}</a>
           </td>
           <td class="font-medium" style="color: var(--ink);">{pkgName(b.package_id)}</td>
+          <td><VariantBadge variant={b.variant} /></td>
           <td><StatusBadge status={b.status} /></td>
           <td style="color: var(--body);">{b.trigger}</td>
           <td class="text-xs" style="color: var(--mute);">{fmtTs(b.queued_at)}</td>
@@ -84,6 +87,7 @@
             <a href="/builds/{b.id}" class="link-vercel">#{b.id}</a>
           </td>
           <td class="font-medium" style="color: var(--ink);">{pkgName(b.package_id)}</td>
+          <td><VariantBadge variant={b.variant} /></td>
           <td><StatusBadge status={b.status} /></td>
           <td style="color: var(--body);">{b.trigger}</td>
           <td class="text-xs" style="color: var(--mute);">{fmtTs(b.queued_at)}</td>

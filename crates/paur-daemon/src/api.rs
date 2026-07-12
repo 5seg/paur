@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{self, Admin};
 use crate::worker::AppState;
+use paur_core::Variant;
 
 /// Build the [`Router`] for the API. Caller is responsible for
 /// `serve`-ing it onto the appropriate listener.
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/packages/:name/rebuild", post(rebuild_package))
         .route("/api/v1/packages/:name/auto", patch(set_package_auto))
         .route("/api/v1/packages/:name/flags", patch(set_package_flags))
+        .route("/api/v1/packages/:name/variants", patch(set_package_variants))
         .route("/api/v1/builds", get(list_builds))
         .route("/api/v1/builds/:id", get(get_build))
         .route("/api/v1/builds/:id/logs", get(stream_logs))
@@ -123,37 +125,71 @@ struct PackageDto {
     aur_url: String,
     last_known_ref: Option<String>,
     auto_rebuild: bool,
+    /// Most recent build of any variant. Kept for back-compat with
+    /// existing UI code paths that just want "is something
+    /// running / latest status". Per-variant latests live in
+    /// `latest_builds`.
     latest_build: Option<LatestBuildDto>,
+    /// Most recent build *per variant*. Empty for variants that
+    /// have never been built. Used by the UI to render the variant
+    /// chips in the package list and detail page.
+    #[serde(default)]
+    latest_builds: Vec<LatestBuildDto>,
     /// Per-package build tuning flags (memory/CPU OOM countermeasures).
     /// Defaults to all-false for clients that predate the field.
     #[serde(default)]
     build_flags: paur_core::PackageBuildFlags,
+    /// Which compiled variants this package is built for. The
+    /// `default` field is always `true` (the daemon's invariant).
+    /// The UI uses this both to render the variant chip column on
+    /// the package list and to draw the variant toggle group on
+    /// the detail page.
+    #[serde(default)]
+    variants: paur_core::PackageVariants,
 }
 
 impl PackageDto {
-    /// Build a `PackageDto` from a `Package` + its latest build. Used
-    /// by every read/write endpoint that returns package data so the
-    /// serialization shape stays consistent.
+    /// Build a `PackageDto` from a `Package` + its latest builds
+    /// (any-variant + per-variant). Used by every read/write
+    /// endpoint that returns package data so the serialization
+    /// shape stays consistent.
     async fn from_pkg(
         db: &paur_db::Db,
         pkg: paur_db::Package,
     ) -> Result<Self, paur_core::Error> {
-        let latest = db.latest_build_for(pkg.id).await?;
+        let latest_any = db.latest_build_for(pkg.id).await?;
+        let mut latest_builds: Vec<LatestBuildDto> = Vec::new();
+        for v in Variant::all() {
+            if let Some(b) = db.latest_build_for_variant(pkg.id, *v).await? {
+                latest_builds.push(LatestBuildDto {
+                    id: b.id,
+                    seq: b.seq,
+                    status: b.status.as_str().to_string(),
+                    pkg_version: b.pkg_version,
+                    finished_at: b.finished_at,
+                    exit_code: b.exit_code,
+                    variant: b.variant,
+                });
+            }
+        }
         Ok(Self {
             id: pkg.id,
             name: pkg.name,
             aur_url: pkg.aur_url,
             last_known_ref: pkg.last_known_ref,
             auto_rebuild: pkg.auto_rebuild,
-            latest_build: latest.map(|b| LatestBuildDto {
+            latest_build: latest_any.map(|b| LatestBuildDto {
                 id: b.id,
                 seq: b.seq,
                 status: b.status.as_str().to_string(),
                 pkg_version: b.pkg_version,
                 finished_at: b.finished_at,
                 exit_code: b.exit_code,
+                variant: b.variant,
             }),
+            latest_builds,
             build_flags: pkg.build_flags,
+            variants: pkg.variants,
         })
     }
 }
@@ -169,6 +205,16 @@ struct LatestBuildDto {
     pkg_version: Option<String>,
     finished_at: Option<i64>,
     exit_code: Option<i64>,
+    /// Which variant this build is for. Always present on
+    /// responses from this daemon; older clients that don't
+    /// know about the field simply ignore it.
+    #[serde(default = "default_variant_tag")]
+    variant: String,
+}
+
+#[allow(dead_code)] // wired via serde default path
+fn default_variant_tag() -> String {
+    "default".into()
 }
 
 async fn list_packages(
@@ -187,6 +233,50 @@ struct AddPackageBody {
     name: String,
     #[serde(default)]
     auto_rebuild: bool,
+    /// Variants to enable for the new package. `default` is
+    /// always included automatically (the daemon's invariant),
+    /// so the user only needs to opt in to `v3` / `v4`.
+    /// `None` / empty means "default only".
+    #[serde(default)]
+    variants: Vec<String>,
+}
+
+/// Resolve a `variants` field from the wire (e.g. `["v3","v4"]`)
+/// into a `PackageVariants`. Unknown tags are rejected with a
+/// 400-equivalent error string so the client can fix them; `default`
+/// is always added back even if the user tried to leave it off.
+fn parse_variants_field(raw: &[String]) -> Result<paur_core::PackageVariants, String> {
+    let mut out = paur_core::PackageVariants::default();
+    for s in raw {
+        let v = Variant::parse(s)
+            .ok_or_else(|| format!("unknown variant: {s:?} (expected default|v3|v4)"))?;
+        out.turn_on(v);
+    }
+    Ok(out)
+}
+
+/// Enqueue one build per active variant in canonical build order
+/// (`default` → `v3` → `v4`). One worker means FIFO ordering is
+/// preserved, so the package is built for each enabled variant
+/// before any other queued work.
+async fn enqueue_all_variants(
+    db: &paur_db::Db,
+    state: &AppState,
+    pkg_id: i64,
+    variants: &paur_core::PackageVariants,
+    trigger: paur_db::BuildTrigger,
+) -> paur_core::Result<()> {
+    let mut first_id: Option<i64> = None;
+    for v in variants.active() {
+        let id = db.enqueue_build(pkg_id, trigger, v).await?;
+        if first_id.is_none() {
+            first_id = Some(id);
+        }
+    }
+    if let Some(id) = first_id {
+        state.send_wake(id).await;
+    }
+    Ok(())
 }
 
 async fn add_package(
@@ -201,19 +291,20 @@ async fn add_package(
         .db
         .upsert_package(name.as_str(), &url, body.auto_rebuild)
         .await?;
-    let build_id = state
-        .db
-        .enqueue_build(id, paur_db::BuildTrigger::Manual)
-        .await?;
-    tracing::info!(pkg = %name, build_id, "package enqueued via API");
-    // Wake the worker so it picks the new build up immediately.
-    state.send_wake(build_id).await;
-    // We synthesize a minimal dto from what we just wrote.
+    let variants = parse_variants_field(&body.variants)
+        .map_err(|e| ApiError(paur_core::Error::Invalid(e)))?;
+    // Persist the variant selection and enqueue the first build
+    // (for the default variant). When the user later enables v3
+    // / v4 via the variants PATCH endpoint, that handler enqueues
+    // the additional builds.
+    let _ = state.db.set_variants(name.as_str(), &variants).await?;
     let pkg = state
         .db
         .get_package_by_name(name.as_str())
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound("package vanished".into())))?;
+    enqueue_all_variants(&state.db, &state, id, &pkg.variants, paur_db::BuildTrigger::Manual).await?;
+    tracing::info!(pkg = %name, "package added/enqueued via API");
     Ok((StatusCode::CREATED, Json(PackageDto::from_pkg(&state.db, pkg).await?)))
 }
 
@@ -296,6 +387,55 @@ async fn set_package_flags(
     Ok(Json(PackageDto::from_pkg(&state.db, p).await?))
 }
 
+/// `PATCH /api/v1/packages/:name/variants` — change the set of
+/// active variants for a package. Admin-only. Each newly-enabled
+/// variant (compared to the previous set) gets a fresh build
+/// enqueued in build order, so the operator can flip `v3` on and
+/// watch the queue start working without further input.
+async fn set_package_variants(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(name): Path<String>,
+    Json(body): Json<AddPackageBody>,
+) -> ApiResult<Json<PackageDto>> {
+    // Re-use the AddPackageBody deserializer: it has the same
+    // shape (name + variants). The `name` field is ignored
+    // because the URL path is the source of truth; the field is
+    // present only for symmetry with `add_package`.
+    let _ = body.name;
+    let desired = parse_variants_field(&body.variants)
+        .map_err(|e| ApiError(paur_core::Error::Invalid(e)))?;
+    let cur = state
+        .db
+        .get_package_by_name(&name)
+        .await?
+        .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
+    let n = state.db.set_variants(&name, &desired).await?;
+    if n == 0 {
+        return Err(ApiError(paur_core::Error::NotFound(name.clone())));
+    }
+    // Enqueue builds for any variant that the user just enabled
+    // (i.e. is in `desired` but wasn't in the previous set). We
+    // don't re-enqueue builds for variants that were already on
+    // — the user can use `rebuild` for that.
+    for v in desired.active() {
+        if !cur.variants.is_active(v) {
+            let id = state
+                .db
+                .enqueue_build(cur.id, paur_db::BuildTrigger::Manual, v)
+                .await?;
+            state.send_wake(id).await;
+        }
+    }
+    tracing::info!(pkg = %name, ?desired, "variants updated via API");
+    let p = state
+        .db
+        .get_package_by_name(&name)
+        .await?
+        .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
+    Ok(Json(PackageDto::from_pkg(&state.db, p).await?))
+}
+
 async fn delete_package(
     State(state): State<Arc<AppState>>,
     _admin: Admin,
@@ -306,11 +446,17 @@ async fn delete_package(
         .get_package_by_name(&name)
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
-    // Remove from the repo first so the next `pacman -Sy` won't see it.
+    // Remove from every variant's repo first so the next
+    // `pacman -Sy` won't see the package in any of the three
+    // arch subdirs. Failures are non-fatal: we still drop the
+    // package row so the daemon forgets it, and the leftover
+    // .pkg.tar.* in the repo dir can be cleaned up by hand.
     let pkg_name = paur_core::PkgName::new(&p.name)
         .map_err(|e| ApiError(paur_core::Error::Invalid(e.to_string())))?;
-    if let Err(e) = paur_repo::remove(&state.repo, &pkg_name).await {
-        tracing::warn!(pkg = %pkg_name, "repo-remove failed (continuing): {e}");
+    for v in Variant::all() {
+        if let Err(e) = paur_repo::remove(&state.repo, &pkg_name, *v).await {
+            tracing::warn!(pkg = %pkg_name, variant = v.as_str(), "repo-remove failed (continuing): {e}");
+        }
     }
     let n = state.db.delete_package(&p.name).await?;
     if n == 0 {
@@ -329,18 +475,25 @@ async fn rebuild_package(
         .get_package_by_name(&name)
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound(name.clone())))?;
-    let id = state
-        .db
-        .enqueue_build(p.id, paur_db::BuildTrigger::Rebuild)
-        .await?;
-    state.send_wake(id).await;
-    Ok(Json(serde_json::json!({ "build_id": id })))
+    // Enqueue one build per active variant. The worker processes
+    // the queue serially, so the default → v3 → v4 order is
+    // preserved.
+    enqueue_all_variants(
+        &state.db,
+        &state,
+        p.id,
+        &p.variants,
+        paur_db::BuildTrigger::Rebuild,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "queued": p.variants.active().len() })))
 }
 
 #[derive(Deserialize)]
 struct ListBuildsQuery {
     pkg: Option<String>,
     status: Option<String>,
+    variant: Option<String>,
     limit: Option<i64>,
 }
 
@@ -361,8 +514,18 @@ async fn list_builds(
         }
         None => None,
     };
+    let variant = match q.variant.as_deref() {
+        Some(v) => Some(
+            Variant::parse(v)
+                .ok_or_else(|| ApiError(paur_core::Error::Invalid(format!("unknown variant: {v}"))))?,
+        ),
+        None => None,
+    };
     let limit = q.limit.unwrap_or(50).clamp(1, 1000);
-    let rows = state.db.list_builds(q.pkg.as_deref(), status, limit).await?;
+    let rows = state
+        .db
+        .list_builds(q.pkg.as_deref(), status, variant, limit)
+        .await?;
     Ok(Json(rows))
 }
 
@@ -449,11 +612,11 @@ async fn stream_logs(
 async fn queue(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let queued = state
         .db
-        .list_builds(None, Some(paur_db::BuildStatus::Queued), 1000)
+        .list_builds(None, Some(paur_db::BuildStatus::Queued), None, 1000)
         .await?;
     let running = state
         .db
-        .list_builds(None, Some(paur_db::BuildStatus::Running), 1000)
+        .list_builds(None, Some(paur_db::BuildStatus::Running), None, 1000)
         .await?;
     Ok(Json(serde_json::json!({
         "queued": queued,
@@ -479,7 +642,7 @@ async fn install_fpr(
     State(state): State<Arc<AppState>>,
     Query(_q): Query<InstallFprQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let pubkey_path = state.repo.arch_dir().join("paur.pubkey.asc");
+    let pubkey_path = state.repo.arch_subdir(Variant::Default).join("paur.pubkey.asc");
     let bytes = tokio::fs::read(&pubkey_path)
         .await
         .map_err(|_| paur_core::Error::NotFound(

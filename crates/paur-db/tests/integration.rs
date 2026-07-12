@@ -37,11 +37,11 @@ async fn build_enqueue_claim_finish() {
         .unwrap();
 
     let b1 = db
-        .enqueue_build(pkg_id, BuildTrigger::Manual)
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::Default)
         .await
         .unwrap();
     let b2 = db
-        .enqueue_build(pkg_id, BuildTrigger::Poll)
+        .enqueue_build(pkg_id, BuildTrigger::Poll, paur_core::Variant::Default)
         .await
         .unwrap();
     assert!(b1 < b2);
@@ -96,7 +96,10 @@ async fn reap_stale_running() {
         .upsert_package("spotify", "https://aur.archlinux.org/spotify.git", false)
         .await
         .unwrap();
-    let b = db.enqueue_build(pkg_id, BuildTrigger::Manual).await.unwrap();
+    let b = db
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
     let _claimed = db.claim_next_queued("lost-worker").await.unwrap().unwrap();
 
     // Simulate a daemon restart: reaps the running build.
@@ -119,8 +122,14 @@ async fn claim_build_by_id_honors_specific_id() {
         .upsert_package("foo", "https://aur.archlinux.org/foo.git", true)
         .await
         .unwrap();
-    let _b1 = db.enqueue_build(pkg_id, BuildTrigger::Manual).await.unwrap();
-    let b2 = db.enqueue_build(pkg_id, BuildTrigger::Manual).await.unwrap();
+    let _b1 = db
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
+    let b2 = db
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::V3)
+        .await
+        .unwrap();
 
     // Wake for b2 specifically.
     let claimed = db
@@ -148,7 +157,10 @@ async fn claim_build_by_id_skips_running_and_finished() {
         .upsert_package("foo", "https://aur.archlinux.org/foo.git", true)
         .await
         .unwrap();
-    let b = db.enqueue_build(pkg_id, BuildTrigger::Manual).await.unwrap();
+    let b = db
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
 
     // First claim makes it running.
     let _ = db.claim_build_by_id(b, "w1").await.unwrap().unwrap();
@@ -173,7 +185,10 @@ async fn logs_append_and_read() {
         .upsert_package("foo", "https://aur.archlinux.org/foo.git", false)
         .await
         .unwrap();
-    let b = db.enqueue_build(pkg_id, BuildTrigger::Manual).await.unwrap();
+    let b = db
+        .enqueue_build(pkg_id, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
 
     db.append_log(b, Stream::Stdout, "==> Making package: foo").await.unwrap();
     db.append_log(b, Stream::Stdout, "==> Tidying install").await.unwrap();
@@ -212,24 +227,31 @@ async fn list_builds_filters() {
         .upsert_package("p2", "https://aur.archlinux.org/p2.git", false)
         .await
         .unwrap();
-    db.enqueue_build(p1, BuildTrigger::Manual).await.unwrap();
-    db.enqueue_build(p2, BuildTrigger::Manual).await.unwrap();
-    db.enqueue_build(p1, BuildTrigger::Poll).await.unwrap();
+    db.enqueue_build(p1, BuildTrigger::Manual, paur_core::Variant::Default).await.unwrap();
+    db.enqueue_build(p2, BuildTrigger::Manual, paur_core::Variant::Default).await.unwrap();
+    db.enqueue_build(p1, BuildTrigger::Poll, paur_core::Variant::Default).await.unwrap();
 
-    let all = db.list_builds(None, None, 100).await.unwrap();
+    let all = db.list_builds(None, None, None, 100).await.unwrap();
     assert_eq!(all.len(), 3);
 
-    let only_p1 = db.list_builds(Some("p1"), None, 100).await.unwrap();
+    let only_p1 = db.list_builds(Some("p1"), None, None, 100).await.unwrap();
     assert_eq!(only_p1.len(), 2);
 
     let queued = db
-        .list_builds(None, Some(BuildStatus::Queued), 100)
+        .list_builds(None, Some(BuildStatus::Queued), None, 100)
         .await
         .unwrap();
     assert_eq!(queued.len(), 3);
 
-    let with_limit = db.list_builds(None, None, 2).await.unwrap();
+    let with_limit = db.list_builds(None, None, None, 2).await.unwrap();
     assert_eq!(with_limit.len(), 2);
+
+    // variant filter
+    let v3_only = db
+        .list_builds(None, None, Some(paur_core::Variant::V3), 100)
+        .await
+        .unwrap();
+    assert_eq!(v3_only.len(), 0);
 }
 
 #[tokio::test]
@@ -251,7 +273,6 @@ async fn build_flags_roundtrip() {
         low_memory: true,
         rust_codegen_units_1: true,
         no_ccache: false,
-        march: None,
     };
     let rows = db
         .set_build_flags("paru-bin", &updated)
@@ -275,4 +296,88 @@ async fn build_flags_roundtrip() {
         .await
         .unwrap();
     assert_eq!(rows_missing, 0);
+}
+
+#[tokio::test]
+async fn variants_default_on_new_package() {
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    db.upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    let p = db.get_package_by_name("hello").await.unwrap().unwrap();
+    // New package gets the default variant set (only).
+    assert!(p.variants.default);
+    assert!(!p.variants.v3);
+    assert!(!p.variants.v4);
+}
+
+#[tokio::test]
+async fn enqueue_build_records_variant() {
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    let pid = db
+        .upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    let bid = db
+        .enqueue_build(pid, BuildTrigger::Manual, paur_core::Variant::V3)
+        .await
+        .unwrap();
+    let b = db.get_build(bid).await.unwrap().unwrap();
+    assert_eq!(b.variant, "v3");
+}
+
+#[tokio::test]
+async fn set_variants_clamps_default_on() {
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    db.upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    // Try to disable default — the daemon must clamp it back to
+    // true. Without this invariant, packages would vanish from
+    // the default repo on next rebuild.
+    let bad = paur_core::PackageVariants {
+        default: false,
+        v3: true,
+        v4: false,
+    };
+    let rows = db.set_variants("hello", &bad).await.unwrap();
+    assert_eq!(rows, 1);
+    let p = db.get_package_by_name("hello").await.unwrap().unwrap();
+    assert!(p.variants.default, "default must be clamped to true");
+    assert!(p.variants.v3);
+    assert!(!p.variants.v4);
+}
+
+#[tokio::test]
+async fn latest_build_for_variant_picks_matching() {
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    let pid = db
+        .upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    let b1 = db
+        .enqueue_build(pid, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
+    let b2 = db
+        .enqueue_build(pid, BuildTrigger::Manual, paur_core::Variant::V3)
+        .await
+        .unwrap();
+    db.finish_build(b2, BuildStatus::Success, Some(0)).await.unwrap();
+
+    let only_v3 = db
+        .latest_build_for_variant(pid, paur_core::Variant::V3)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(only_v3.id, b2);
+    assert_eq!(only_v3.variant, "v3");
+
+    let only_default = db
+        .latest_build_for_variant(pid, paur_core::Variant::Default)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(only_default.variant, "default");
+    assert_eq!(only_default.id, b1);
 }

@@ -44,14 +44,14 @@ async fn poll_once(state: &AppState) -> Result<(), paur_core::Error> {
         let mut live = std::collections::HashSet::new();
         for b in state
             .db
-            .list_builds(None, Some(paur_db::BuildStatus::Queued), 1000)
+            .list_builds(None, Some(paur_db::BuildStatus::Queued), None, 1000)
             .await?
         {
             live.insert(b.package_id);
         }
         for b in state
             .db
-            .list_builds(None, Some(paur_db::BuildStatus::Running), 1000)
+            .list_builds(None, Some(paur_db::BuildStatus::Running), None, 1000)
             .await?
         {
             live.insert(b.package_id);
@@ -89,7 +89,7 @@ async fn poll_once(state: &AppState) -> Result<(), paur_core::Error> {
         // failing build doesn't permanently disable auto-rebuild.
         let _ = state
             .db
-            .enqueue_build(p.id, BuildTrigger::Poll)
+            .enqueue_build(p.id, BuildTrigger::Poll, paur_core::Variant::Default)
             .await?;
         triggered += 1;
     }
@@ -131,7 +131,7 @@ mod tests {
         // No builds enqueued.
         let queued = state
             .db
-            .list_builds(None, Some(paur_db::BuildStatus::Queued), 100)
+            .list_builds(None, Some(paur_db::BuildStatus::Queued), None, 100)
             .await
             .unwrap();
         assert!(queued.is_empty(), "expected no queued builds, got {queued:?}");

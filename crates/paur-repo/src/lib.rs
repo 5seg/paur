@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use paur_builder::{run_repo_op, RepoOp, RepoOpRequest};
-use paur_core::{ContainerRuntime, PkgName, S3Config};
+use paur_core::{ContainerRuntime, PkgName, S3Config, Variant};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoCtx {
     /// Path to `<name>.db.tar.gz` (the `*` is implicit; pass without
@@ -56,10 +56,22 @@ pub struct RepoCtx {
 #[async_trait]
 pub trait RepoOps: Send + Sync {
     /// Stage `pkg_files` into a per-publish directory the container
-    /// can read, then ask the container to `repo-add` them.
-    async fn add(&self, ctx: &RepoCtx, db_name: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()>;
-    /// Ask the container to `repo-remove` the named package.
-    async fn remove(&self, ctx: &RepoCtx, db_name: &str, pkgname: &str) -> paur_core::Result<()>;
+    /// can read, then ask the container to `repo-add` them into the
+    /// DB for the given variant.
+    async fn add(
+        &self,
+        ctx: &RepoCtx,
+        variant: Variant,
+        pkg_files: &[PathBuf],
+    ) -> paur_core::Result<()>;
+    /// Ask the container to `repo-remove` the named package from
+    /// the given variant's DB.
+    async fn remove(
+        &self,
+        ctx: &RepoCtx,
+        variant: Variant,
+        pkgname: &str,
+    ) -> paur_core::Result<()>;
 }
 
 /// Default implementation: shells out to the builder container.
@@ -67,7 +79,12 @@ pub struct ContainerRepoOps;
 
 #[async_trait]
 impl RepoOps for ContainerRepoOps {
-    async fn add(&self, ctx: &RepoCtx, db_name: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()> {
+    async fn add(
+        &self,
+        ctx: &RepoCtx,
+        variant: Variant,
+        pkg_files: &[PathBuf],
+    ) -> paur_core::Result<()> {
         let stage_dir = ctx.repo_dir.join(".stage");
         std::fs::create_dir_all(&stage_dir)?;
         let mut names = Vec::with_capacity(pkg_files.len());
@@ -81,11 +98,12 @@ impl RepoOps for ContainerRepoOps {
             })?;
             names.push(name.to_string_lossy().into_owned());
         }
+        let arch_dir = ctx.arch_subdir(variant);
         let req = RepoOpRequest {
             op: RepoOp::Add,
-            repo_dir: ctx.arch_dir(),
+            arch_dir,
             stage_dir,
-            db_name: db_name.to_string(),
+            db_name: ctx.db_basename_for(variant),
             names,
             runtime: ctx.container_runtime,
             image: ctx.builder_image.clone(),
@@ -94,12 +112,17 @@ impl RepoOps for ContainerRepoOps {
         Ok(())
     }
 
-    async fn remove(&self, ctx: &RepoCtx, db_name: &str, pkgname: &str) -> paur_core::Result<()> {
+    async fn remove(
+        &self,
+        ctx: &RepoCtx,
+        variant: Variant,
+        pkgname: &str,
+    ) -> paur_core::Result<()> {
         let req = RepoOpRequest {
             op: RepoOp::Remove,
-            repo_dir: ctx.arch_dir(),
+            arch_dir: ctx.arch_subdir(variant),
             stage_dir: ctx.repo_dir.join(".stage"),
-            db_name: db_name.to_string(),
+            db_name: ctx.db_basename_for(variant),
             names: vec![pkgname.to_string()],
             runtime: ctx.container_runtime,
             image: ctx.builder_image.clone(),
@@ -110,42 +133,60 @@ impl RepoOps for ContainerRepoOps {
 }
 
 impl RepoCtx {
-    /// Architecture-specific directory of the repo.
+    /// Architecture-specific directory for the default variant,
+    /// e.g. `<repo_dir>/x86_64`. Kept for callers that don't care
+    /// about variants (e.g. legacy code paths and tests).
     pub fn arch_dir(&self) -> PathBuf {
         self.repo_dir.join(&self.arch)
     }
 
-    /// Path to the canonical database file (`<name>.db.tar.gz`).
-    /// `repo-add` requires the full `.db.tar.gz` suffix on its first
-    /// positional argument; this is the form we use for that tool.
-    pub fn db_path_for_repo_add(&self) -> PathBuf {
-        self.arch_dir()
-            .join(format!("{}.db.tar.gz", self.repo_name))
+    /// Architecture-specific directory for a given variant, e.g.
+    /// `<repo_dir>/x86_64` (default), `<repo_dir>/x86_64-v3`,
+    /// `<repo_dir>/x86_64-v4`. This is where `.pkg.tar.*` files
+    /// land and where `repo-add` writes the DB.
+    pub fn arch_subdir(&self, variant: Variant) -> PathBuf {
+        let name = match variant {
+            Variant::Default => self.arch.clone(),
+            Variant::V3 => format!("{}-v3", self.arch),
+            Variant::V4 => format!("{}-v4", self.arch),
+        };
+        self.repo_dir.join(name)
     }
 
-    /// Path to the database file we sign. The signed file is the
-    /// canonical `.db.tar.gz` (the file `repo-add` produces).
-    fn db_path(&self) -> PathBuf {
-        self.db_path_for_repo_add()
+    /// Repo DB basename for a variant, e.g. `paur` / `paur-v3` /
+    /// `paur-v4`. `repo-add` requires the full `.db.tar.gz` suffix
+    /// on its first positional argument; this is the form we use
+    /// for that tool.
+    pub fn db_basename_for(&self, variant: Variant) -> String {
+        match variant {
+            Variant::Default => format!("{}.db.tar.gz", self.repo_name),
+            Variant::V3 => format!("{}-v3.db.tar.gz", self.repo_name),
+            Variant::V4 => format!("{}-v4.db.tar.gz", self.repo_name),
+        }
     }
 
-    /// Path to the database signature. We sign the .db.tar.gz file.
-    fn db_sig(&self) -> PathBuf {
-        let mut p = self.db_path_for_repo_add().into_os_string();
+    /// Path to the database file for a given variant.
+    pub fn db_path_for(&self, variant: Variant) -> PathBuf {
+        self.arch_subdir(variant).join(self.db_basename_for(variant))
+    }
+
+    /// Path to the database signature for a given variant.
+    pub fn db_sig_for(&self, variant: Variant) -> PathBuf {
+        let mut p = self.db_path_for(variant).into_os_string();
         p.push(".sig");
         PathBuf::from(p)
     }
-
-    /// The `<name>.db.tar.gz` basename (used by the builder script).
-    fn db_basename(&self) -> String {
-        format!("{}.db.tar.gz", self.repo_name)
-    }
 }
 
-/// Add `.pkg.tar.zst` files to the repo. Returns the new DB sig path
-/// so callers can confirm signing succeeded.
-pub async fn publish(ctx: &RepoCtx, pkg_files: &[PathBuf]) -> paur_core::Result<PathBuf> {
-    publish_with(ctx, pkg_files, &ContainerRepoOps).await
+/// Add `.pkg.tar.zst` files to the repo (specific variant).
+/// Returns the new DB sig path so callers can confirm signing
+/// succeeded.
+pub async fn publish(
+    ctx: &RepoCtx,
+    pkg_files: &[PathBuf],
+    variant: Variant,
+) -> paur_core::Result<PathBuf> {
+    publish_with(ctx, pkg_files, variant, &ContainerRepoOps).await
 }
 
 /// Same as [`publish`] but lets the caller inject a [`RepoOps`].
@@ -153,14 +194,16 @@ pub async fn publish(ctx: &RepoCtx, pkg_files: &[PathBuf]) -> paur_core::Result<
 pub async fn publish_with(
     ctx: &RepoCtx,
     pkg_files: &[PathBuf],
+    variant: Variant,
     ops: &dyn RepoOps,
 ) -> paur_core::Result<PathBuf> {
     if pkg_files.is_empty() {
         return Err(paur_core::Error::Build("no .pkg.tar.zst to publish".into()));
     }
-    std::fs::create_dir_all(ctx.arch_dir())?;
+    let arch_dir = ctx.arch_subdir(variant);
+    std::fs::create_dir_all(&arch_dir)?;
 
-    // Copy artifacts into the arch dir (so pacman can fetch them
+    // Copy artifacts into the arch subdir (so pacman can fetch them
     // directly from Caddy). repo-add runs in the container; the
     // script reads the staged copies there.
     let mut staged: Vec<PathBuf> = Vec::new();
@@ -168,7 +211,7 @@ pub async fn publish_with(
         let name = src.file_name().ok_or_else(|| {
             paur_core::Error::Repo(format!("artifact has no file name: {}", src.display()))
         })?;
-        let dst = ctx.arch_dir().join(name);
+        let dst = arch_dir.join(name);
         std::fs::copy(src, &dst).map_err(|e| {
             paur_core::Error::Repo(format!("copy {} -> {}: {e}", src.display(), dst.display()))
         })?;
@@ -176,14 +219,15 @@ pub async fn publish_with(
     }
 
     // Ask the container to update the DB.
-    ops.add(ctx, &ctx.db_basename(), &staged).await?;
+    ops.add(ctx, variant, &staged).await?;
 
     // Re-sign the DB. The container's `repo-add` deletes the
     // existing .sig (because the DB content changes) so we always
     // produce a fresh one.
-    let db_sig = ctx.db_sig();
+    let db_path = ctx.db_path_for(variant);
+    let db_sig = ctx.db_sig_for(variant);
     let _ = std::fs::remove_file(&db_sig);
-    sign(&ctx.gpg_home, &ctx.gpg_key, &ctx.db_path()).await?;
+    sign(&ctx.gpg_home, &ctx.gpg_key, &db_path).await?;
 
     for pkg in &staged {
         let sig = {
@@ -208,8 +252,7 @@ pub async fn publish_with(
     if let Some(s3_cfg) = ctx.s3.clone() {
         let client = paur_s3::S3Client::new(s3_cfg);
         // 1) Upload the DB and its sig.
-        let db_key = format!("{}/{}.db.tar.gz", ctx.arch, ctx.db_basename());
-        let db_path = ctx.db_path();
+        let db_key = format!("{}/{}", ctx.arch_subdir(variant).file_name().and_then(|n| n.to_str()).unwrap_or(&ctx.arch), ctx.db_basename_for(variant));
         if let Err(e) = upload_path(&client, &db_key, "application/x-gzip", &db_path).await {
             tracing::warn!(error = %e, key = %db_key, "s3: db upload failed");
         }
@@ -219,11 +262,12 @@ pub async fn publish_with(
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            let pkg_key = format!("{}/{}", ctx.arch, name);
+            let subdir = ctx.arch_subdir(variant).file_name().and_then(|n| n.to_str()).unwrap_or(&ctx.arch).to_string();
+            let pkg_key = format!("{}/{}", subdir, name);
             if let Err(e) = upload_path(&client, &pkg_key, "application/zstd", pkg).await {
                 tracing::warn!(error = %e, key = %pkg_key, "s3: pkg upload failed");
             }
-            let sig_key = format!("{}/{}.sig", ctx.arch, name);
+            let sig_key = format!("{}/{}.sig", subdir, name);
             let sig_path = {
                 let mut s = pkg.as_os_str().to_owned();
                 s.push(".sig");
@@ -237,19 +281,16 @@ pub async fn publish_with(
                 }
             }
         }
-        // 3) Upload the paur.files tarball (clients fetch this too).
-        let files_key = format!("{}/{}.files.tar.gz", ctx.arch, ctx.db_basename());
-        let files_path = {
-            let mut s = ctx.db_path().into_os_string();
-            s.push(".files.tar.gz");
-            let p = PathBuf::from(s);
-            // The DB basename is e.g. "paur"; the files tarball is
-            // "paur.files.tar.gz". Strip the duplicated ".db" first.
-            // Easier: re-derive from repo_name.
-            drop(p);
-            ctx.repo_dir.join(&ctx.arch).join(format!("{}.files.tar.gz", ctx.repo_name))
-        };
+        // 3) Upload the .files tarball (clients fetch this too).
+        let subdir = ctx.arch_subdir(variant).file_name().and_then(|n| n.to_str()).unwrap_or(&ctx.arch).to_string();
+        let files_basename = format!("{}.files.tar.gz", match variant {
+            Variant::Default => ctx.repo_name.clone(),
+            Variant::V3 => format!("{}-v3", ctx.repo_name),
+            Variant::V4 => format!("{}-v4", ctx.repo_name),
+        });
+        let files_path = arch_dir.join(&files_basename);
         if files_path.exists() {
+            let files_key = format!("{}/{}", subdir, files_basename);
             if let Err(e) =
                 upload_path(&client, &files_key, "application/x-gzip", &files_path).await
             {
@@ -281,22 +322,27 @@ async fn upload_path(
 /// Remove a package from the repo DB and sign the updated DB. The
 /// `.pkg.tar.*` file itself is left in place; callers should unlink
 /// it after this returns.
-pub async fn remove(ctx: &RepoCtx, pkg: &PkgName) -> paur_core::Result<()> {
-    remove_with(ctx, pkg, &ContainerRepoOps).await
+pub async fn remove(
+    ctx: &RepoCtx,
+    pkg: &PkgName,
+    variant: Variant,
+) -> paur_core::Result<()> {
+    remove_with(ctx, pkg, variant, &ContainerRepoOps).await
 }
 
 /// Same as [`remove`] but with an injectable [`RepoOps`].
 pub async fn remove_with(
     ctx: &RepoCtx,
     pkg: &PkgName,
+    variant: Variant,
     ops: &dyn RepoOps,
 ) -> paur_core::Result<()> {
-    ops.remove(ctx, &ctx.db_basename(), pkg.as_str()).await?;
+    ops.remove(ctx, variant, pkg.as_str()).await?;
 
     // Re-sign the DB.
-    let db_sig = ctx.db_sig();
+    let db_sig = ctx.db_sig_for(variant);
     let _ = std::fs::remove_file(&db_sig);
-    sign(&ctx.gpg_home, &ctx.gpg_key, &ctx.db_path()).await?;
+    sign(&ctx.gpg_home, &ctx.gpg_key, &ctx.db_path_for(variant)).await?;
     Ok(())
 }
 
@@ -507,7 +553,7 @@ mod tests {
     /// a container. Lets the publish/remove code paths run end-to-end
     /// in a unit test.
     struct MockOps {
-        adds: std::sync::Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+        adds: std::sync::Arc<tokio::sync::Mutex<Vec<(Variant, Vec<String>)>>>,
         removes: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
@@ -522,23 +568,38 @@ mod tests {
 
     #[async_trait]
     impl RepoOps for MockOps {
-        async fn add(&self, _ctx: &RepoCtx, _db: &str, pkg_files: &[PathBuf]) -> paur_core::Result<()> {
+        async fn add(
+            &self,
+            _ctx: &RepoCtx,
+            variant: Variant,
+            pkg_files: &[PathBuf],
+        ) -> paur_core::Result<()> {
             let names: Vec<String> = pkg_files
                 .iter()
                 .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
                 .collect();
             // Simulate repo-add's behavior of (re)writing the DB file.
-            // Touch a stub .db.tar.gz so the post-publish assertions
-            // find something on disk.
+            // Touch a stub .db.tar.gz with the *variant's* basename
+            // so the post-publish assertions find something on disk.
             if let Some(p) = pkg_files.first() {
                 if let Some(dir) = p.parent() {
-                    std::fs::write(dir.join("paur.db.tar.gz"), b"fake-db").unwrap();
+                    let db_name = match variant {
+                        Variant::Default => "paur.db.tar.gz",
+                        Variant::V3 => "paur-v3.db.tar.gz",
+                        Variant::V4 => "paur-v4.db.tar.gz",
+                    };
+                    std::fs::write(dir.join(db_name), b"fake-db").unwrap();
                 }
             }
-            self.adds.lock().await.push(names);
+            self.adds.lock().await.push((variant, names));
             Ok(())
         }
-        async fn remove(&self, _ctx: &RepoCtx, _db: &str, pkgname: &str) -> paur_core::Result<()> {
+        async fn remove(
+            &self,
+            _ctx: &RepoCtx,
+            _variant: Variant,
+            pkgname: &str,
+        ) -> paur_core::Result<()> {
             self.removes.lock().await.push(pkgname.to_string());
             Ok(())
         }
@@ -567,7 +628,12 @@ mod tests {
             s3: None,
         };
         assert_eq!(ctx.arch_dir(), PathBuf::from("/var/lib/paur/repo/x86_64"));
-        assert_eq!(ctx.db_basename(), "paur.db.tar.gz");
+        assert_eq!(ctx.db_basename_for(Variant::Default), "paur.db.tar.gz");
+        assert_eq!(ctx.arch_subdir(Variant::Default), PathBuf::from("/var/lib/paur/repo/x86_64"));
+        assert_eq!(ctx.arch_subdir(Variant::V3), PathBuf::from("/var/lib/paur/repo/x86_64-v3"));
+        assert_eq!(ctx.arch_subdir(Variant::V4), PathBuf::from("/var/lib/paur/repo/x86_64-v4"));
+        assert_eq!(ctx.db_basename_for(Variant::V3), "paur-v3.db.tar.gz");
+        assert_eq!(ctx.db_basename_for(Variant::V4), "paur-v4.db.tar.gz");
     }
 
     #[tokio::test]
@@ -604,22 +670,25 @@ mod tests {
         std::fs::write(&artifact, b"fake").unwrap();
 
         let mock = MockOps::new();
-        publish_with(&ctx, std::slice::from_ref(&artifact), &mock)
+        publish_with(&ctx, std::slice::from_ref(&artifact), Variant::V3, &mock)
             .await
             .unwrap();
-        // .pkg.tar.* copied into the arch dir
-        assert!(ctx.arch_dir().join(artifact.file_name().unwrap()).exists());
-        // .db.tar.gz written and signed
-        assert!(ctx.arch_dir().join("paur.db.tar.gz").exists());
-        assert!(ctx.db_sig().exists());
-        // Mock recorded the add
-        assert_eq!(mock.adds.lock().await.len(), 1);
+        // .pkg.tar.* copied into the v3 arch dir
+        let v3_dir = ctx.arch_subdir(Variant::V3);
+        assert!(v3_dir.join(artifact.file_name().unwrap()).exists());
+        // .db.tar.gz written and signed in the v3 arch dir
+        assert!(v3_dir.join("paur-v3.db.tar.gz").exists());
+        assert!(ctx.db_sig_for(Variant::V3).exists());
+        // Mock recorded the add with the variant tag
+        let recorded = mock.adds.lock().await.clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, Variant::V3);
 
         // Now remove.
         let pkg = paur_core::PkgName::new("foo").unwrap();
-        remove_with(&ctx, &pkg, &mock).await.unwrap();
+        remove_with(&ctx, &pkg, Variant::V3, &mock).await.unwrap();
         let removed = mock.removes.lock().await.clone();
         assert_eq!(removed, vec!["foo".to_string()]);
-        assert!(ctx.db_sig().exists());
+        assert!(ctx.db_sig_for(Variant::V3).exists());
     }
 }

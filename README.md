@@ -66,10 +66,19 @@ export PAUR_DATA_DIR=$HOME/.local/share/paur-dev
 
 # 4. Drive it from another terminal
 ./target/release/paur-cli add hello
+./target/release/paur-cli add gpu-pkg --variant v3 --variant v4
+./target/release/paur-cli flag hello --variant v3
 ./target/release/paur-cli list
 ./target/release/paur-cli status hello
 # (The build fails without `docker build -t paur-builder:latest container/`,
-#  but the API roundtrip and GPG signing are visible.)
+#  but the API roundtrip, variant enqueue, and GPG signing are visible.)
+# Each package can opt into extra build variants with
+# `paur-cli flag <pkg> --variant v3` (toggle). The default
+# variant is always built; v3 and v4 are CachyOS-style
+# `-march=x86-64-vN` builds that land in `repo/x86_64-v3/` and
+# `repo/x86_64-v4/` respectively. The three arch dirs are
+# served side by side so a single `Include` in pacman.conf
+# pulls any of them.
 
 # 5. Or open the Web UI
 xdg-open http://127.0.0.1:7300/
@@ -126,13 +135,43 @@ sudo pacman-key --lsign-key "$FPR"
 sudo pacman -U --noconfirm 'http://paur.example/repo/x86_64/paur-keyring-1-1-any.pkg.tar.zst'
 sudo pacman -U --noconfirm 'http://paur.example/repo/x86_64/paur-mirrorlist-1-1-any.pkg.tar.zst'
 
-# 3. Add the repo to pacman.conf
+# 3. Add the repo to pacman.conf. paur publishes to three arch
+#    variants (x86_64 / x86_64-v3 / x86_64-v4). A single
+#    `[paur]` section pulls all three via the `paur-mirrorlist`
+#    Include — pacman matches the right Server line by `$arch`
+#    expansion. The mirrorlist ships three `Server =` lines:
+#
+#      Server = http://paur.example/repo/$arch
+#      Server = http://paur.example/repo/$arch-v3
+#      Server = http://paur.example/repo/$arch-v4
+#
+#    `default` (x86_64) is always published. `v3` and `v4` only
+#    land in the repo for packages where you've enabled the
+#    variant via `paur-cli flag <pkg> --variant v3` (or via
+#    the web UI). All three repos share the same GPG key
+#    (`paur-keyring` covers them all), so you don't need
+#    separate keyring installs.
+#
+#    The optional `[paur-v3]` / `[paur-v4]` sections below
+#    are commented out; uncomment them if you want to control
+#    which arch variants pacman can pick. The default section
+#    alone is enough to fetch any package — pacman ignores
+#    Server lines that point at a non-existent arch dir.
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
 Include = /etc/pacman.d/paur-mirrorlist
+
+#[paur-v3]
+#Include = /etc/pacman.d/paur-mirrorlist
+
+#[paur-v4]
+#Include = /etc/pacman.d/paur-mirrorlist
 EOF
 
-# 4. Sync and install
+# 4. Sync and install. `hello-pkg` (default only) installs
+#    straight from `[paur]`. If you enabled v3 / v4 for the
+#    package, pacman pulls the matching `.pkg.tar.zst` from
+#    the v3 / v4 arch dir when those sections are enabled.
 sudo pacman -Sy hello-pkg
 ```
 

@@ -118,6 +118,13 @@ pub struct Package {
     /// is empty (older rows from before migration 0004).
     #[serde(default)]
     pub build_flags: paur_core::PackageBuildFlags,
+    /// Which compiled variants this package should be built for.
+    /// `default` is always true; `v3` / `v4` are independent
+    /// toggles. JSON blob from `PackageVariants`. Defaults to
+    /// `{default:true, v3:false, v4:false}` when the column is
+    /// empty (older rows from before migration 0005).
+    #[serde(default)]
+    pub variants: paur_core::PackageVariants,
 }
 
 /// A row of the `builds` table.
@@ -138,6 +145,10 @@ pub struct Build {
     pub pkg_version: Option<String>,
     pub worker_id: Option<String>,
     pub trigger: BuildTrigger,
+    /// Which variant this build is for. Set at enqueue time from
+    /// the package's active `PackageVariants`. The DB CHECK
+    /// constraint narrows this to the three known values.
+    pub variant: String,
 }
 
 /// A row of the `settings` table.

@@ -15,6 +15,7 @@ use sqlx::SqlitePool;
 
 use crate::models::{Build, BuildStatus, BuildTrigger, Package, Setting, Stream};
 use crate::schema;
+use paur_core::Variant;
 
 /// Handle to the paur SQLite database. Cheap to clone (it's just an `Arc`).
 #[derive(Debug, Clone)]
@@ -80,7 +81,7 @@ impl Db {
     /// Look up a package by its canonical name.
     pub async fn get_package_by_name(&self, name: &str) -> paur_core::Result<Option<Package>> {
         let row = sqlx::query(
-            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags
+            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags, variants
              FROM packages WHERE name = ?",
         )
         .bind(name)
@@ -93,7 +94,7 @@ impl Db {
     /// List all packages, newest first.
     pub async fn list_packages(&self) -> paur_core::Result<Vec<Package>> {
         let rows = sqlx::query(
-            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags
+            "SELECT id, name, aur_url, last_known_ref, added_at, enabled, auto_rebuild, build_flags, variants
              FROM packages ORDER BY added_at DESC",
         )
         .fetch_all(&self.pool)
@@ -165,16 +166,40 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Replace the `variants` JSON blob for a package. Returns the
+    /// number of rows affected (0 if the package does not exist).
+    /// The `default` field is forced to `true` before persisting —
+    /// every package gets a plain build, no exceptions.
+    pub async fn set_variants(
+        &self,
+        name: &str,
+        variants: &paur_core::PackageVariants,
+    ) -> paur_core::Result<u64> {
+        let mut sanitized = *variants;
+        sanitized.default = true;
+        let blob = serde_json::to_string(&sanitized)
+            .map_err(|e| paur_core::Error::Db(format!("serialize variants: {e}")))?;
+        let res = sqlx::query("UPDATE packages SET variants = ? WHERE name = ?")
+            .bind(blob)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
     // -------- builds --------
 
     /// Enqueue a new build for a package. The build is created in
-    /// `queued` state with the given trigger. The per-package `seq`
-    /// number is allocated inside the same transaction so two
-    /// concurrent enqueues for the same package cannot collide.
+    /// `queued` state with the given trigger and variant. The
+    /// per-package `seq` number is allocated inside the same
+    /// transaction so two concurrent enqueues for the same
+    /// package cannot collide.
     pub async fn enqueue_build(
         &self,
         package_id: i64,
         trigger: BuildTrigger,
+        variant: Variant,
     ) -> paur_core::Result<i64> {
         let now = Self::now();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
@@ -191,14 +216,15 @@ impl Db {
         .await
         .map_err(db_err)?;
         let row = sqlx::query(
-            "INSERT INTO builds (package_id, status, queued_at, trigger, seq)
-             VALUES (?, 'queued', ?, ?, ?)
+            "INSERT INTO builds (package_id, status, queued_at, trigger, seq, variant)
+             VALUES (?, 'queued', ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(package_id)
         .bind(now)
         .bind(trigger.as_str())
         .bind(next_seq)
+        .bind(variant.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -214,7 +240,7 @@ impl Db {
         // Pick the oldest queued build.
         let row = sqlx::query(
             "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
-                    pkg_file, pkg_version, worker_id, trigger
+                    pkg_file, pkg_version, worker_id, trigger, variant
              FROM builds WHERE status = 'queued'
              ORDER BY queued_at ASC, id ASC LIMIT 1",
         )
@@ -236,7 +262,7 @@ impl Db {
         // Re-read the now-running row.
         let row = sqlx::query(
             "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
-                    pkg_file, pkg_version, worker_id, trigger
+                    pkg_file, pkg_version, worker_id, trigger, variant
              FROM builds WHERE id = ?",
         )
         .bind(id)
@@ -278,7 +304,7 @@ impl Db {
         }
         let row = sqlx::query(
             "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
-                    pkg_file, pkg_version, worker_id, trigger
+                    pkg_file, pkg_version, worker_id, trigger, variant
              FROM builds WHERE id = ?",
         )
         .bind(build_id)
@@ -327,7 +353,7 @@ impl Db {
     pub async fn get_build(&self, id: i64) -> paur_core::Result<Option<Build>> {
         let row = sqlx::query(
             "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
-                    pkg_file, pkg_version, worker_id, trigger
+                    pkg_file, pkg_version, worker_id, trigger, variant
              FROM builds WHERE id = ?",
         )
         .bind(id)
@@ -337,15 +363,36 @@ impl Db {
         Ok(row.map(|r| row_to_build(&r)))
     }
 
-    /// Fetch the most recent build for a package, if any.
+    /// Fetch the most recent build for a package (any variant), if
+    /// any. For the per-variant latest, use [`Self::latest_build_for_variant`].
     pub async fn latest_build_for(&self, package_id: i64) -> paur_core::Result<Option<Build>> {
         let row = sqlx::query(
             "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
-                    pkg_file, pkg_version, worker_id, trigger
+                    pkg_file, pkg_version, worker_id, trigger, variant
              FROM builds WHERE package_id = ?
              ORDER BY queued_at DESC, id DESC LIMIT 1",
         )
         .bind(package_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| row_to_build(&r)))
+    }
+
+    /// Fetch the most recent build for a package + specific variant.
+    pub async fn latest_build_for_variant(
+        &self,
+        package_id: i64,
+        variant: Variant,
+    ) -> paur_core::Result<Option<Build>> {
+        let row = sqlx::query(
+            "SELECT id, package_id, seq, status, queued_at, started_at, finished_at, exit_code,
+                    pkg_file, pkg_version, worker_id, trigger, variant
+             FROM builds WHERE package_id = ? AND variant = ?
+             ORDER BY queued_at DESC, id DESC LIMIT 1",
+        )
+        .bind(package_id)
+        .bind(variant.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -357,12 +404,13 @@ impl Db {
         &self,
         pkg: Option<&str>,
         status: Option<BuildStatus>,
+        variant: Option<Variant>,
         limit: i64,
     ) -> paur_core::Result<Vec<Build>> {
         // Build a query dynamically. For simplicity, branch on filters.
         let mut sql = String::from(
             "SELECT b.id, b.package_id, b.seq, b.status, b.queued_at, b.started_at, b.finished_at,
-                    b.exit_code, b.pkg_file, b.pkg_version, b.worker_id, b.trigger
+                    b.exit_code, b.pkg_file, b.pkg_version, b.worker_id, b.trigger, b.variant
              FROM builds b",
         );
         let mut conds: Vec<String> = Vec::new();
@@ -371,6 +419,9 @@ impl Db {
         }
         if status.is_some() {
             conds.push("b.status = ?".to_string());
+        }
+        if variant.is_some() {
+            conds.push("b.variant = ?".to_string());
         }
         if !conds.is_empty() {
             sql.push_str(" WHERE ");
@@ -383,6 +434,9 @@ impl Db {
         }
         if let Some(s) = status {
             q = q.bind(s.as_str());
+        }
+        if let Some(v) = variant {
+            q = q.bind(v.as_str());
         }
         q = q.bind(limit);
         let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
@@ -575,6 +629,9 @@ fn row_to_package(r: sqlx::sqlite::SqliteRow) -> Package {
     let flags_json: String = r.get::<Option<String>, _>(7).unwrap_or_else(|| "{}".into());
     let build_flags: paur_core::PackageBuildFlags =
         serde_json::from_str(&flags_json).unwrap_or_default();
+    let variants_json: String = r.get::<Option<String>, _>(8).unwrap_or_else(|| "{}".into());
+    let variants: paur_core::PackageVariants =
+        serde_json::from_str(&variants_json).unwrap_or_default();
     Package {
         id: r.get(0),
         name: r.get(1),
@@ -584,6 +641,7 @@ fn row_to_package(r: sqlx::sqlite::SqliteRow) -> Package {
         enabled: r.get::<i64, _>(5) != 0,
         auto_rebuild: r.get::<i64, _>(6) != 0,
         build_flags,
+        variants,
     }
 }
 
@@ -603,6 +661,7 @@ fn row_to_build(r: &sqlx::sqlite::SqliteRow) -> Build {
         pkg_version: r.get(9),
         worker_id: r.get(10),
         trigger: trigger_s.parse().unwrap_or(BuildTrigger::Manual),
+        variant: r.get::<String, _>(12),
     }
 }
 

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use paur_core::{ContainerRuntime, PackageBuildFlags, PkgName};
+use paur_core::{ContainerRuntime, PackageBuildFlags, PkgName, Variant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -46,6 +46,11 @@ pub struct BuildRequest {
     /// - `no_ccache`              → skips the ccache bind mount
     /// Empty flags are a no-op (use the daemon default).
     pub flags: PackageBuildFlags,
+    /// Which compiled variant this build is for. The daemon picks
+    /// the variant from the package's `PackageVariants` at enqueue
+    /// time; the builder turns it into the `PAUR_MARCH` env that
+    /// `build.sh`'s `apply_march` reads.
+    pub variant: Variant,
 }
 
 /// What the build produced.
@@ -150,14 +155,15 @@ pub async fn run_in_container(
         // the inner makepkg can re-export RUSTFLAGS as needed.
         cmd.arg("-e").arg("PAUR_RUST_CGU=1");
     }
-    if let Some(level) = req.flags.march {
-        // We pass the *level name* (v3 / v4) rather than the
-        // resolved CFLAGS. build.sh owns the actual recipe
-        // (CachyOS-style `-march=x86-64-vN -O2 -pipe -fno-plt`,
-        // CXXFLAGS=${CFLAGS}, RUSTFLAGS append), so changing the
-        // recipe does not require a daemon rebuild.
+    if let Some(level) = req.variant.as_paur_march() {
+        // Pass the *level name* (v3 / v4) rather than the resolved
+        // CFLAGS. build.sh owns the actual recipe (CachyOS-style
+        // `-march=x86-64-vN -O2 -pipe -fno-plt`, CXXFLAGS=${CFLAGS},
+        // RUSTFLAGS append), so changing the recipe does not
+        // require a daemon rebuild. `Default` builds skip the env
+        // entirely so the container uses its stock makepkg.conf.
         cmd.arg("-e")
-            .arg(format!("PAUR_MARCH={}", level.as_str()));
+            .arg(format!("PAUR_MARCH={}", level));
     }
     cmd.arg(&req.image)
         .arg(req.pkg.as_str())
@@ -269,12 +275,14 @@ pub struct RepoOpRequest {
     /// What to do.
     pub op: RepoOp,
     /// Bind-mounted architecture-specific repo directory
-    /// (e.g. `/var/lib/paur/repo/x86_64`).
-    pub repo_dir: PathBuf,
+    /// (e.g. `/var/lib/paur/repo/x86_64-v3`). The container
+    /// treats this as the working dir for `repo-add` /
+    /// `repo-remove`.
+    pub arch_dir: PathBuf,
     /// Bind-mounted staging directory containing the .pkg.tar.*
     /// files to register. Required for `Add`, ignored otherwise.
     pub stage_dir: PathBuf,
-    /// Repo DB basename (e.g. `paur.db.tar.gz`).
+    /// Repo DB basename (e.g. `paur-v3.db.tar.gz`).
     pub db_name: String,
     /// For `Add`: package file names (relative to `stage_dir`).
     /// For `Remove`: the package name registered in the DB.
@@ -308,8 +316,8 @@ impl RepoOp {
 pub async fn run_repo_op(req: &RepoOpRequest) -> paur_core::Result<i32> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(&req.repo_dir)?;
-    std::fs::set_permissions(&req.repo_dir, std::fs::Permissions::from_mode(0o777))?;
+    std::fs::create_dir_all(&req.arch_dir)?;
+    std::fs::set_permissions(&req.arch_dir, std::fs::Permissions::from_mode(0o777))?;
     std::fs::create_dir_all(&req.stage_dir)?;
     std::fs::set_permissions(
         &req.stage_dir,
@@ -320,12 +328,13 @@ pub async fn run_repo_op(req: &RepoOpRequest) -> paur_core::Result<i32> {
     let mut cmd = Command::new(bin);
     cmd.args(["run", "--rm"])
         .arg("-v")
-        .arg(format!("{}:/work/repo", req.repo_dir.display()))
+        .arg(format!("{}:/work/repo", req.arch_dir.display()))
         .arg("-v")
         .arg(format!("{}:/work/stage", req.stage_dir.display()))
         .arg(&req.image)
         .arg(req.op.as_str())
-        .arg(&req.db_name);
+        .arg(&req.db_name)
+        .arg(req.arch_dir.to_string_lossy().as_ref());
     for n in &req.names {
         // repo-add takes paths; repo-remove takes a bare name. We
         // pass the same value either way and let the script sort it
@@ -345,7 +354,7 @@ pub async fn run_repo_op(req: &RepoOpRequest) -> paur_core::Result<i32> {
         runtime = bin,
         image = %req.image,
         op = req.op.as_str(),
-        repo_dir = %req.repo_dir.display(),
+        arch_dir = %req.arch_dir.display(),
         stage_dir = %req.stage_dir.display(),
         "spawning repo-op container"
     );
