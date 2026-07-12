@@ -41,34 +41,80 @@
     }
   }
 
+  // Three-repo pacman.conf block. Each repo corresponds to one
+  // physical arch dir on the server (`x86_64`, `x86_64-v3`,
+  // `x86_64-v4`). v3 / v4 builds are opt-in per package; the repo
+  // itself is always present but only carries packages whose
+  // variants include that march level. Users who don't want to
+  // pull v3 / v4 binaries can comment out those two sections and
+  // keep `[paur]` only.
+  const baseUrl = $derived(`${location.protocol}//${host}/repo`);
   const script = $derived(
     `# Bootstrap an Arch client against this paur server.
+# paur serves THREE pacman repos: default (x86_64) plus opt-in
+# x86_64-v3 (Haswell+) and x86_64-v4 (Zen4 / Sapphire Rapids+).
+# A package built for a given march is only published to that
+# repo; pacman picks the highest-priority enabled repo that has
+# the package, so v3 / v4 only "win" when their section is
+# enabled AND the package is published there.
 
-# 1. Find this server's GPG fingerprint.
-FPR=$(curl -sSL ${`${location.protocol}//${host}/repo/${arch}`}/paur.pubkey.asc \\
-        | gpg --import-options show-only --import 2>/dev/null \\
-        | awk '/^pub/{print $2}' | head -1 | cut -d/ -f2)
+# 1. Find this server's GPG fingerprint. The pubkey is identical
+#    across all three repos (single key, served once per arch
+#    dir). We pull it from the default repo's arch dir.
+#
+#    We use \`gpg --import\` + \`--list-keys --with-colons\` to
+#    extract the full 40-char fingerprint. The lighter
+#    \`--import-options show-only\` route is unreliable for
+#    ed25519 keys (the \`pub\` line has no Key ID to extract).
+#
+#    On a fresh install, run \`pacman-key --init\` once before
+#    \`--lsign-key\`, otherwise the latter errors with "There is
+#    no secret key available to sign with".
+FPR=$(curl -sSL ${baseUrl}/${arch}/paur.pubkey.asc \\
+        | gpg --import 2>/dev/null \\
+        && gpg --list-keys --with-colons 2>/dev/null \\
+        | awk -F: '/^fpr/{print $10; exit}')
 echo "FPR=$FPR"
+sudo pacman-key --init
 
 # 2. Bootstrap: add the pubkey to the local keyring and lsign it.
 #    --lsign-key prompts for the local keyring's passphrase,
 #    which defaults to empty on a fresh install.
-sudo pacman-key --add <(curl -sSL ${`${location.protocol}//${host}/repo/${arch}`}/paur.pubkey.asc)
+sudo pacman-key --add <(curl -sSL ${baseUrl}/${arch}/paur.pubkey.asc)
 sudo pacman-key --lsign-key "$FPR"
 
-# 3. Install the keyring + mirrorlist meta-packages. The
-#    post-install hook on \`paur-keyring\` runs
-#    \`pacman-key --populate paur\`, which re-imports the pubkey
-#    and lsigns every FPR in \`paur-trusted\` at full trust.
-sudo pacman -U --noconfirm '${`${location.protocol}//${host}/repo/${arch}`}/paur-keyring-1-1-any.pkg.tar.zst'
-sudo pacman -U --noconfirm '${`${location.protocol}//${host}/repo/${arch}`}/paur-mirrorlist-1-1-any.pkg.tar.zst'
+# 3. Install the keyring meta-package. The post-install hook on
+#    \`paur-keyring\` runs \`pacman-key --populate paur\`, which
+#    re-imports the pubkey and lsigns every FPR in \`paur-trusted\`
+#    at full trust. (The meta-package lives in the default repo;
+#    once installed, it works for the v3 / v4 repos too because
+#    the same key signs all three.)
+sudo pacman -U --noconfirm '${baseUrl}/${arch}/paur-keyring-1-1-any.pkg.tar.zst'
 
-# 4. Enable the repo in pacman.conf and sync.
+# 4. Enable the three repos in pacman.conf. Edit the file
+#    interactively or paste the block at the end. Each section
+#    uses \`\$arch\` so the same block works on x86_64 and any
+#    other arch paur publishes for. Comment out [paur-v3] and
+#    [paur-v4] if you only want the default builds.
 sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
 [paur]
-Include = /etc/pacman.d/paur-mirrorlist
+SigLevel = Required DatabaseOptional
+Server = ${baseUrl}/$arch
+
+[paur-v3]
+SigLevel = Required DatabaseOptional
+Server = ${baseUrl}/$arch-v3
+
+[paur-v4]
+SigLevel = Required DatabaseOptional
+Server = ${baseUrl}/$arch-v4
 EOF
-sudo pacman -Sy hello-pkg`
+sudo pacman -Sy hello-pkg
+
+# Optional: list which packages have a v3 / v4 build available
+# without installing them. The variants field is per-package on
+# the daemon; the queue page shows what's currently in flight.
+# curl -s ${baseUrl}/../api/v1/packages | jq '.[] | {name, variants}'`
   );
 
   async function copy() {
