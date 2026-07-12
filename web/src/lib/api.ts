@@ -192,8 +192,13 @@ export const api = {
   /// Replace the active variant set for a package. The daemon
   /// forces `default` on regardless of what's passed, so the
   /// caller may omit it. An empty array means "default only".
+  /// The endpoint re-uses the add-package deserializer, so the
+  /// body shape is `{ name, variants }` — the `name` field is
+  /// ignored server-side (URL path is the source of truth) but
+  /// is required by the struct, so we send it for compatibility.
   setVariants: (name: string, variants: Variant[]) =>
     sendJson<Package>('PATCH', `/api/v1/packages/${name}/variants`, {
+      name,
       variants
     }),
   listBuilds: (opts: { pkg?: string; status?: string; limit?: number } = {}) => {
