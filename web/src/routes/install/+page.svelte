@@ -70,8 +70,18 @@
 #    On a fresh install, run \`pacman-key --init\` once before
 #    \`--lsign-key\`, otherwise the latter errors with "There is
 #    no secret key available to sign with".
-FPR=$(curl -sSL ${baseUrl}/${arch}/paur.pubkey.asc \\
-        | gpg --import 2>/dev/null \\
+#
+#    Note: we deliberately avoid bash process substitution
+#    (\`<(...)\`) together with \`sudo\`. sudo's default
+#    \`closefrom\` closes inherited file descriptors, so the
+#    inner fd (\`/dev/fd/NN\`) is gone by the time \`pacman-key\`
+#    runs, and it errors with "can't open '/dev/fd/NN': No such
+#    file or directory". Writing to a tempfile and passing the
+#    path is portable.
+PUB=$(mktemp)
+trap 'rm -f "$PUB"' EXIT
+curl -sSL ${baseUrl}/${arch}/paur.pubkey.asc -o "$PUB"
+FPR=$(gpg --import "$PUB" 2>/dev/null \\
         && gpg --list-keys --with-colons 2>/dev/null \\
         | awk -F: '/^fpr/{print $10; exit}')
 echo "FPR=$FPR"
@@ -79,9 +89,13 @@ sudo pacman-key --init
 
 # 2. Bootstrap: add the pubkey to the local keyring and lsign it.
 #    --lsign-key prompts for the local keyring's passphrase,
-#    which defaults to empty on a fresh install.
-sudo pacman-key --add <(curl -sSL ${baseUrl}/${arch}/paur.pubkey.asc)
+#    which defaults to empty on a fresh install. The \`sudo cp\`
+#    dance below puts the key in a root-owned path so \`pacman-key
+#    --add\` can read it.
+sudo cp "$PUB" /etc/pacman.d/paur.pubkey.asc
+sudo pacman-key --add /etc/pacman.d/paur.pubkey.asc
 sudo pacman-key --lsign-key "$FPR"
+sudo rm -f /etc/pacman.d/paur.pubkey.asc
 
 # 3. Install the keyring meta-package. The post-install hook on
 #    \`paur-keyring\` runs \`pacman-key --populate paur\`, which
@@ -109,7 +123,7 @@ Server = ${baseUrl}/$arch-v3
 SigLevel = Required DatabaseOptional
 Server = ${baseUrl}/$arch-v4
 EOF
-sudo pacman -Sy hello-pkg
+sudo pacman -Sy hello
 
 # Optional: list which packages have a v3 / v4 build available
 # without installing them. The variants field is per-package on
