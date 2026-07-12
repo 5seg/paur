@@ -77,6 +77,11 @@ enum Cmd {
         /// Package name.
         name: String,
     },
+    /// Cancel a queued or running build by id.
+    Cancel {
+        /// Build id (as shown in the WebUI queue or `paur-cli status`).
+        id: i64,
+    },
     /// Read or update per-package build tuning flags and active
     /// variants. With no flags, prints the current values.
     Flag {
@@ -199,6 +204,10 @@ async fn run(cli: Cli, cfg: Config) -> Result<(), cmd::CmdError> {
         Cmd::Rebuild { name } => {
             let c = client(&cfg, cli.api.as_deref());
             cmd::rebuild(&c, &name).await
+        }
+        Cmd::Cancel { id } => {
+            let c = client(&cfg, cli.api.as_deref());
+            cmd::cancel(&c, id).await
         }
         Cmd::Flag {
             name,

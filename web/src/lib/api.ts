@@ -180,6 +180,17 @@ export const api = {
     sendJson<void>('DELETE', `/api/v1/packages/${name}`),
   rebuildPackage: (name: string) =>
     sendJson<{ build_id: number }>('POST', `/api/v1/packages/${name}/rebuild`),
+  /**
+   * Cancel a queued or running build. The daemon flips the DB
+   * row to `cancelled` and (for a running build) also kills the
+   * container. Throws an `ApiError` with status 409 if the build
+   * is already in a terminal state, 404 if the id is unknown.
+   */
+  cancelBuild: (id: number) =>
+    sendJson<{ id: number; status: string }>(
+      'POST',
+      `/api/v1/builds/${id}/cancel`
+    ),
   setAutoRebuild: (name: string, auto_rebuild: boolean) =>
     sendJson<Package>('PATCH', `/api/v1/packages/${name}/auto`, { auto_rebuild }),
   /**

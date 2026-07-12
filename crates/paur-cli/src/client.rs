@@ -168,6 +168,19 @@ impl DaemonClient {
             .ok_or_else(|| ClientError::Other("missing build_id in response".into()))
     }
 
+    /// `POST /api/v1/builds/:id/cancel` — cancel a queued or
+    /// running build. For a queued build this is just a DB
+    /// flip; for a running build the daemon also kills the
+    /// container. Returns the id and final status on success.
+    /// Returns an `Api` error with status 409 if the build is
+    /// already terminal (success/failed/cancelled) or 404 if
+    /// the id is unknown.
+    pub async fn cancel_build(&self, id: i64) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/v1/builds/{}/cancel", self.base, id);
+        let resp = self.http.post(&url).send().await?;
+        self.parse(resp).await
+    }
+
     /// `PATCH /api/v1/packages/:name/flags` — set per-package build
     /// tuning flags. `flags` is serialized as JSON; any field set to
     /// `true` becomes active on the next build, and the daemon

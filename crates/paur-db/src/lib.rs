@@ -5,7 +5,7 @@ pub mod queries;
 pub mod schema;
 
 pub use models::{Build, BuildStatus, BuildTrigger, Package, Setting, Stream};
-pub use queries::Db;
+pub use queries::{CancelOutcome, Db};
 
 use std::path::Path;
 

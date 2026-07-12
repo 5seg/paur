@@ -381,3 +381,57 @@ async fn latest_build_for_variant_picks_matching() {
     assert_eq!(only_default.variant, "default");
     assert_eq!(only_default.id, b1);
 }
+
+#[tokio::test]
+async fn cancel_queued_build_flips_status_and_claim_skips() {
+    use paur_db::CancelOutcome;
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    let pid = db
+        .upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    let b1 = db
+        .enqueue_build(pid, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
+    // Cancel a queued build → Cancelled.
+    let out = db.cancel_build(b1).await.unwrap();
+    assert_eq!(out, CancelOutcome::Cancelled);
+    let row = db.get_build(b1).await.unwrap().unwrap();
+    assert_eq!(row.status, BuildStatus::Cancelled);
+    assert!(row.finished_at.is_some(), "finished_at stamped");
+    // The worker's claim query should now skip the row.
+    let claimed = db.claim_next_queued("w").await.unwrap();
+    assert!(claimed.is_none(), "cancelled build is not claimable");
+    // Cancelling again is a no-op (AlreadyTerminal).
+    let out2 = db.cancel_build(b1).await.unwrap();
+    assert_eq!(
+        out2,
+        CancelOutcome::AlreadyTerminal(BuildStatus::Cancelled)
+    );
+    // Cancelling a non-existent id → NotFound.
+    let out3 = db.cancel_build(99999).await.unwrap();
+    assert_eq!(out3, CancelOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn cancel_running_build_flips_status_without_exit_code() {
+    use paur_db::CancelOutcome;
+    let db = paur_db::open(Path::new(":memory:")).await.unwrap();
+    let pid = db
+        .upsert_package("hello", "https://aur.archlinux.org/hello.git", false)
+        .await
+        .unwrap();
+    let b1 = db
+        .enqueue_build(pid, BuildTrigger::Manual, paur_core::Variant::Default)
+        .await
+        .unwrap();
+    // Manually mark it running (simulate the worker's claim).
+    let _ = db.claim_build_by_id(b1, "w").await.unwrap().unwrap();
+    let out = db.cancel_build(b1).await.unwrap();
+    assert_eq!(out, CancelOutcome::Cancelled);
+    let row = db.get_build(b1).await.unwrap().unwrap();
+    assert_eq!(row.status, BuildStatus::Cancelled);
+    assert!(row.exit_code.is_none(), "no exit_code for cancelled");
+    assert!(row.finished_at.is_some());
+}

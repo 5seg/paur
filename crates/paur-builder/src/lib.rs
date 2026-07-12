@@ -20,6 +20,7 @@ use paur_aur::SrcInfo;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use paur_core::{ContainerRuntime, PackageBuildFlags, PkgName, Variant};
 #[cfg(unix)]
@@ -62,6 +63,14 @@ pub struct BuildOutcome {
     pub pkg_files: Vec<PathBuf>,
     /// Parsed `.SRCINFO` if makepkg got that far. `None` for failed builds.
     pub srcinfo: Option<SrcInfo>,
+    /// `true` if the build was cancelled via the cancel token
+    /// (i.e. the container was killed by the daemon, not by the
+    /// container itself exiting). Callers should record the
+    /// build as `Cancelled` rather than `Failed` in this case —
+    /// the exit code is whatever `kill` produces and not
+    /// meaningful.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 /// A pluggable destination for each log line produced by a build.
@@ -99,9 +108,16 @@ impl LogSink for CollectingSink {
 
 /// Run a build in a container. Streams logs into `sink`. Returns the
 /// outcome (exit code + artifact paths).
+///
+/// `cancel` is a `CancellationToken` the caller can fire to kill the
+/// container mid-build. Firing it sets `BuildOutcome.cancelled = true`
+/// and returns the exit code produced by `kill` (typically negative
+/// or `137` on SIGKILL). When the container finishes naturally the
+/// token is left untouched.
 pub async fn run_in_container(
     req: &BuildRequest,
     sink: std::sync::Arc<dyn LogSink>,
+    cancel: CancellationToken,
 ) -> paur_core::Result<BuildOutcome> {
     // Pre-create the expected on-disk layout. The container is bind-
     // mounted to /work and /ccache, both of which must exist.
@@ -215,17 +231,42 @@ pub async fn run_in_container(
         })
     };
 
-    let status = child.wait().await.map_err(|e| {
-        paur_core::Error::Build(format!("waiting on {bin} run: {e}"))
-    })?;
+    // Wait for the container to exit, OR for the cancel token to
+    // fire. If the token wins the race, we kill the container and
+    // let `wait()` reap it; the resulting `cancelled = true` flag
+    // tells the caller to record the build as `Cancelled` rather
+    // than `Failed` (the exit code is whatever `kill` produces and
+    // is not meaningful for a user-facing status).
+    let mut child = child;
+    let cancelled;
+    let status = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            tracing::info!(pkg = %req.pkg, "build cancelled: killing container");
+            // `start_kill` is non-blocking; `wait` will then reap
+            // the child. The docker/podman `--rm` flag means the
+            // container is removed automatically on exit.
+            let _ = child.start_kill();
+            cancelled = true;
+            child.wait().await.map_err(|e| {
+                paur_core::Error::Build(format!("waiting on {bin} run after kill: {e}"))
+            })?
+        }
+        s = child.wait() => {
+            cancelled = false;
+            s.map_err(|e| {
+                paur_core::Error::Build(format!("waiting on {bin} run: {e}"))
+            })?
+        }
+    };
     // Drain log tasks (they should already be EOF by now).
     let _ = out_task.await;
     let _ = err_task.await;
 
     let exit_code = status.code().unwrap_or(-1);
-    tracing::info!(pkg = %req.pkg, exit_code, "container finished");
+    tracing::info!(pkg = %req.pkg, exit_code, cancelled, "container finished");
 
-    let pkg_files = if exit_code == 0 {
+    let pkg_files = if exit_code == 0 && !cancelled {
         list_artifacts(&req.work_dir.join("out"))?
     } else {
         Vec::new()
@@ -247,6 +288,7 @@ pub async fn run_in_container(
         exit_code,
         pkg_files,
         srcinfo,
+        cancelled,
     })
 }
 
@@ -555,6 +597,7 @@ pub async fn run_local_in_container(
         exit_code,
         pkg_files,
         srcinfo: None,
+        cancelled: false,
     })
 }
 

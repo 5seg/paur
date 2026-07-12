@@ -252,6 +252,22 @@ pub async fn rebuild(client: &DaemonClient, pkg: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// `paur-cli cancel <build_id>` — cancel a queued or running
+/// build. The daemon flips the DB row to `cancelled`; if the
+/// build was running, it also fires an in-process token that
+/// kills the container mid-build. 409 means the build is
+/// already in a terminal state (success/failed/cancelled),
+/// 404 means the id is unknown.
+pub async fn cancel(client: &DaemonClient, id: i64) -> Result<(), CmdError> {
+    let v = client.cancel_build(id).await?;
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("cancelled");
+    println!("build {}: {}", id, status);
+    Ok(())
+}
+
 /// `paur-cli flag <pkg> [--variant v3] [--variant v4]`
 ///
 /// Per-package build tuning flags (memory/CPU countermeasures) and

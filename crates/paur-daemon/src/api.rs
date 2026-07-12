@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/packages/:name/variants", patch(set_package_variants))
         .route("/api/v1/builds", get(list_builds))
         .route("/api/v1/builds/:id", get(get_build))
+        .route("/api/v1/builds/:id/cancel", post(cancel_build))
         .route("/api/v1/builds/:id/logs", get(stream_logs))
         .route("/api/v1/builds/:id/logs.txt", get(raw_logs))
         .route("/api/v1/queue", get(queue))
@@ -96,6 +97,7 @@ impl IntoResponse for ApiError {
             paur_core::Error::Invalid(_) | paur_core::Error::InvalidName(..) => {
                 StatusCode::BAD_REQUEST
             }
+            paur_core::Error::Conflict(_) => StatusCode::CONFLICT,
             paur_core::Error::MissingDep(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -539,6 +541,51 @@ async fn get_build(
         .await?
         .ok_or_else(|| ApiError(paur_core::Error::NotFound(format!("build {id}"))))?;
     Ok(Json(b))
+}
+
+/// `POST /api/v1/builds/:id/cancel` — admin-only.
+///
+/// Two-step cancel:
+///   1. `cancel_build` flips the DB row to `cancelled` (or
+///      reports `AlreadyTerminal` / `NotFound`).
+///   2. If the build was `running`, we also fire its
+///      `CancellationToken` so the in-flight container is
+///      killed and the worker re-stamps the row as
+///      `Cancelled` (rather than `Failed`) on its way out.
+///
+/// Returns 200 on actual cancellation, 404 if the id is
+/// unknown, 409 if the build is already in a terminal state.
+async fn cancel_build(
+    State(state): State<Arc<AppState>>,
+    _admin: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use paur_db::CancelOutcome;
+    let outcome = state.db.cancel_build(id).await?;
+    match outcome {
+        CancelOutcome::NotFound => Err(ApiError(paur_core::Error::NotFound(format!(
+            "build {id}"
+        )))),
+        CancelOutcome::AlreadyTerminal(s) => Err(ApiError(paur_core::Error::Conflict(
+            format!("build {id} is already in terminal state: {}", s.as_str()),
+        ))),
+        CancelOutcome::Cancelled => {
+            // Fire the in-process token if the build is currently
+            // running. We do this *after* the DB update so the
+            // registry map and the DB row are consistent: even if
+            // the worker is mid-claim and didn't insert its token
+            // yet, the row is already `cancelled` and the next
+            // claim attempt will skip it.
+            let token = state.cancel_tokens.lock().await.remove(&id);
+            if let Some(t) = token {
+                t.cancel();
+            }
+            Ok(Json(serde_json::json!({
+                "id": id,
+                "status": "cancelled",
+            })))
+        }
+    }
 }
 
 async fn raw_logs(

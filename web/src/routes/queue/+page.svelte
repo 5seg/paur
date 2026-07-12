@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, fmtTs, type Queue, type Package, type Build } from '$lib/api';
+  import { goto } from '$app/navigation';
+  import { api, ApiError, fmtTs, type Queue, type Package, type Build } from '$lib/api';
+  import { authState } from '$lib/auth';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
   import VariantBadge from '$lib/components/VariantBadge.svelte';
   import DeploymentTable from '$lib/components/DeploymentTable.svelte';
@@ -8,6 +10,7 @@
   let queue = $state<Queue | null>(null);
   let pkgs = $state<Package[]>([]);
   let error = $state<string | null>(null);
+  let cancelling = $state<Set<number>>(new Set());
 
   async function refresh() {
     try {
@@ -21,6 +24,25 @@
   function pkgName(packageId: number): string {
     const p = pkgs.find((x) => x.id === packageId);
     return p ? p.name : `#${packageId}`;
+  }
+
+  async function cancelBuild(id: number) {
+    if (cancelling.has(id)) return;
+    cancelling = new Set([...cancelling, id]);
+    try {
+      await api.cancelBuild(id);
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        goto('/login');
+        return;
+      }
+      alert(`cancel failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      const next = new Set(cancelling);
+      next.delete(id);
+      cancelling = next;
+    }
   }
 
   onMount(() => {
@@ -37,6 +59,12 @@
     { key: 'trigger', label: 'Trigger', class: 'w-32' },
     { key: 'queued', label: 'Queued', class: 'w-40' }
   ];
+
+  let cancelColumns = $derived(
+    $authState.authenticated
+      ? [...columns, { key: 'actions', label: '', class: 'w-16' }]
+      : columns
+  );
 </script>
 
 <h1 class="mb-6 text-2xl font-semibold tracking-tight" style="color: var(--ink);">Queue</h1>
@@ -59,7 +87,7 @@
     {#if queue.running.length > 0}
       <div class="progress-bar mb-4"></div>
     {/if}
-    <DeploymentTable {columns} rows={queue.running} empty="Nothing running.">
+    <DeploymentTable columns={cancelColumns} rows={queue.running} empty="Nothing running.">
       {#snippet row(b: Build)}
         <tr>
           <td class="font-mono text-xs">
@@ -70,6 +98,19 @@
           <td><StatusBadge status={b.status} /></td>
           <td style="color: var(--body);">{b.trigger}</td>
           <td class="text-xs" style="color: var(--mute);">{fmtTs(b.queued_at)}</td>
+          {#if $authState.authenticated}
+            <td class="text-right">
+              <button
+                type="button"
+                class="btn btn-danger"
+                aria-label="cancel build {b.id}"
+                disabled={cancelling.has(b.id)}
+                onclick={() => cancelBuild(b.id)}
+              >
+                ×
+              </button>
+            </td>
+          {/if}
         </tr>
       {/snippet}
     </DeploymentTable>
@@ -80,7 +121,7 @@
       <h2 class="text-lg font-semibold tracking-tight" style="color: var(--ink);">Queued</h2>
       <span class="text-sm" style="color: var(--mute);">({queue.queued.length})</span>
     </div>
-    <DeploymentTable {columns} rows={queue.queued} empty="Queue is empty.">
+    <DeploymentTable columns={cancelColumns} rows={queue.queued} empty="Queue is empty.">
       {#snippet row(b: Build)}
         <tr>
           <td class="font-mono text-xs">
@@ -91,6 +132,19 @@
           <td><StatusBadge status={b.status} /></td>
           <td style="color: var(--body);">{b.trigger}</td>
           <td class="text-xs" style="color: var(--mute);">{fmtTs(b.queued_at)}</td>
+          {#if $authState.authenticated}
+            <td class="text-right">
+              <button
+                type="button"
+                class="btn btn-danger"
+                aria-label="cancel build {b.id}"
+                disabled={cancelling.has(b.id)}
+                onclick={() => cancelBuild(b.id)}
+              >
+                ×
+              </button>
+            </td>
+          {/if}
         </tr>
       {/snippet}
     </DeploymentTable>

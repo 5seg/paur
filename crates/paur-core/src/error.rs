@@ -58,6 +58,11 @@ pub enum Error {
     #[error("invalid: {0}")]
     Invalid(String),
 
+    /// Operation attempted on a build in a terminal state (success,
+    /// failed, or already cancelled). HTTP-mapped to 409 Conflict.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// A required external tool is missing (docker, podman, repo-add, gpg).
     #[error("missing dependency: {0}")]
     MissingDep(String),

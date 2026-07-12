@@ -17,6 +17,26 @@ use crate::models::{Build, BuildStatus, BuildTrigger, Package, Setting, Stream};
 use crate::schema;
 use paur_core::Variant;
 
+/// Outcome of [`Db::cancel_build`]. Lets the caller distinguish the
+/// "already terminal" case (HTTP 409) from "actually cancelled"
+/// (HTTP 200) without having to round-trip through the build row
+/// themselves.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Build row exists and was in `queued` or `running`; it has
+    /// now been marked `cancelled`. The caller is responsible for
+    /// signalling any in-flight worker (the DB layer cannot
+    /// interrupt a running container directly — see
+    /// `paur_daemon::AppState::cancel_build` for the
+    /// in-process side of this).
+    Cancelled,
+    /// Build row exists but is already in a terminal state
+    /// (`success`, `failed`, `cancelled`). No rows were updated.
+    AlreadyTerminal(BuildStatus),
+    /// No row with that id exists.
+    NotFound,
+}
+
 /// Handle to the paur SQLite database. Cheap to clone (it's just an `Arc`).
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -335,6 +355,69 @@ impl Db {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Mark a build as `cancelled`. Returns the outcome
+    /// ([`CancelOutcome`]) so the caller can distinguish a no-op
+    /// (already terminal / not found) from an actual state change.
+    ///
+    /// For a `queued` build, the worker will skip it on its next
+    /// `claim_build_by_id` call (that claim query now filters out
+    /// `cancelled` rows). For a `running` build, this only updates
+    /// the DB row; the in-process worker must be signalled
+    /// separately (e.g. via a `CancellationToken` registry in the
+    /// daemon) so it can kill the container and finish the row
+    /// with `Cancelled` as the terminal status.
+    pub async fn cancel_build(&self, id: i64) -> paur_core::Result<CancelOutcome> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row = sqlx::query("SELECT status FROM builds WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let Some(row) = row else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(CancelOutcome::NotFound);
+        };
+        let cur: String = row.get(0);
+        let cur = match cur.as_str() {
+            "queued" => BuildStatus::Queued,
+            "running" => BuildStatus::Running,
+            "success" => BuildStatus::Success,
+            "failed" => BuildStatus::Failed,
+            "cancelled" => BuildStatus::Cancelled,
+            other => {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(paur_core::Error::Db(format!(
+                    "build {id} has unknown status: {other:?}"
+                )));
+            }
+        };
+        match cur {
+            BuildStatus::Queued | BuildStatus::Running => {
+                // Flip to cancelled and stamp finished_at. We
+                // don't set exit_code — cancellation is an
+                // operator action, not a container result.
+                let now = Self::now();
+                let res = sqlx::query(
+                    "UPDATE builds SET status = 'cancelled', finished_at = ?
+                     WHERE id = ? AND status = ?",
+                )
+                .bind(now)
+                .bind(id)
+                .bind(cur.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                tx.commit().await.map_err(db_err)?;
+                debug_assert_eq!(res.rows_affected(), 1);
+                Ok(CancelOutcome::Cancelled)
+            }
+            terminal => {
+                tx.rollback().await.map_err(db_err)?;
+                Ok(CancelOutcome::AlreadyTerminal(terminal))
+            }
+        }
     }
 
     /// Record the produced `.pkg.tar.zst` path and version for a build.

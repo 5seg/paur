@@ -10,6 +10,7 @@ use paur_core::Variant;
 use paur_db::{BuildStatus, Stream};
 use paur_repo::RepoCtx;
 use tokio::sync::{broadcast, Mutex};
+use tokio_util::sync::CancellationToken;
 
 /// Shared state passed to every worker. Cheap to clone (everything
 /// inside is `Arc`-wrapped).
@@ -29,6 +30,15 @@ pub struct AppState {
     /// during [`run`]; before that, it's `None` and `send_wake` is
     /// a no-op.
     pub wake: Arc<Mutex<Option<tokio::sync::mpsc::Sender<i64>>>>,
+    /// Per-build cancellation tokens. Inserted by the worker when
+    /// it claims a build and starts the container; removed when
+    /// the build finishes (success / fail / cancel). The HTTP
+    /// `POST /api/v1/builds/:id/cancel` handler takes a token out
+    /// of this map and fires it; the worker's `select!` then
+    /// kills the container and the worker re-stamps the row as
+    /// `Cancelled`.
+    pub cancel_tokens:
+        Arc<Mutex<std::collections::HashMap<i64, CancellationToken>>>,
 }
 
 impl AppState {
@@ -42,6 +52,7 @@ impl AppState {
             repo: Arc::new(repo),
             log_channels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             wake: Arc::new(Mutex::new(None)),
+            cancel_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -200,6 +211,19 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
 
     tracing::info!(build_id, pkg = %pkg_name, "starting build");
 
+    // Register a cancellation token for this build *before* spawning
+    // the container. The HTTP cancel endpoint reads this map; if the
+    // token is in place, it can fire the token and the in-flight
+    // `select!` below will kill the container and let the build
+    // resolve as `Cancelled` rather than `Failed`. We remove the
+    // entry in the cleanup at the bottom of this function.
+    let cancel = CancellationToken::new();
+    state
+        .cancel_tokens
+        .lock()
+        .await
+        .insert(build.id, cancel.clone());
+
     // Compose a LogSink that writes to DB + text file + broadcast.
     let sink = DbLogSink::new(state.clone(), build.id);
     let sink: Arc<dyn LogSink> = Arc::new(sink);
@@ -223,17 +247,30 @@ async fn process_one(state: &AppState, build_id: i64) -> Result<(), paur_core::E
         flags: pkg.build_flags.clone(),
         variant,
     };
-    let outcome = paur_builder::run_in_container(&req, Arc::clone(&sink)).await?;
+    let outcome = paur_builder::run_in_container(&req, Arc::clone(&sink), cancel).await?;
+
+    // Always drop our cancel-token entry, regardless of how the
+    // build resolved. The build row's terminal status will be set
+    // below; if a cancel races with a natural finish, this just
+    // removes a now-stale entry.
+    state.cancel_tokens.lock().await.remove(&build.id);
 
     // Record outcome and (on success) publish to the repo.
-    let final_status = if outcome.exit_code == 0 {
+    // `cancelled` short-circuits the success/fail branch: the
+    // operator asked for cancellation, the container was killed,
+    // and the exit code is whatever `kill` produced (not
+    // meaningful). We record `Cancelled` with `exit_code = None`
+    // and skip publish entirely.
+    let final_status = if outcome.cancelled {
+        BuildStatus::Cancelled
+    } else if outcome.exit_code == 0 {
         BuildStatus::Success
     } else {
         BuildStatus::Failed
     };
     state
         .db
-        .finish_build(build.id, final_status, Some(outcome.exit_code as i32))
+        .finish_build(build.id, final_status, final_status_exit_code(&outcome))
         .await?;
 
     if final_status == BuildStatus::Success {
@@ -319,6 +356,19 @@ async fn publish_artifacts(
         .collect();
     paur_repo::publish(&state.repo, &pkg_files, variant).await?;
     Ok(())
+}
+
+/// Pick the exit_code that should land in the `builds.exit_code`
+/// column for a given outcome. Cancelled builds have no meaningful
+/// exit code (the container was `kill`ed, not exited on its own),
+/// so we record `NULL` and let the `Cancelled` status itself be the
+/// signal.
+fn final_status_exit_code(outcome: &BuildOutcome) -> Option<i32> {
+    if outcome.cancelled {
+        None
+    } else {
+        Some(outcome.exit_code as i32)
+    }
 }
 
 /// LogSink that writes each line to the DB, the log file, and any

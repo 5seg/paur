@@ -1,7 +1,9 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { onMount, onDestroy } from 'svelte';
-  import { api, fmtTs, streamLogs, type Build } from '$lib/api';
+  import { goto } from '$app/navigation';
+  import { api, ApiError, fmtTs, streamLogs, type Build } from '$lib/api';
+  import { authState } from '$lib/auth';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
   import VariantBadge from '$lib/components/VariantBadge.svelte';
 
@@ -10,6 +12,7 @@
   let logLines = $state<string[]>([]);
   let error = $state<string | null>(null);
   let streaming = $state(true);
+  let cancelling = $state(false);
   let es: EventSource | null = null;
   let logEl: HTMLDivElement | null = $state(null);
 
@@ -65,6 +68,29 @@
   async function refresh() {
     await loadInitial();
   }
+
+  async function cancelBuild() {
+    if (cancelling || !build) return;
+    if (!confirm(`Cancel build #${build.id}?`)) return;
+    cancelling = true;
+    try {
+      await api.cancelBuild(build.id);
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        goto('/login');
+        return;
+      }
+      alert(`cancel failed: ${e instanceof Error ? e.message : e}`);
+    } finally {
+      cancelling = false;
+    }
+  }
+
+  let canCancel = $derived(
+    $authState.authenticated && build !== null &&
+      (build.status === 'queued' || build.status === 'running')
+  );
 </script>
 
 <div class="mb-4 flex items-center gap-3">
@@ -79,6 +105,15 @@
   {/if}
   <div class="ml-auto flex items-center gap-3">
     <button class="btn" onclick={refresh}>Refresh</button>
+    {#if canCancel}
+      <button
+        class="btn btn-danger"
+        onclick={cancelBuild}
+        disabled={cancelling}
+      >
+        {cancelling ? 'Cancelling…' : 'Cancel'}
+      </button>
+    {/if}
     <span class="text-xs" style="color: var(--mute);">{streaming ? 'live' : 'cached'}</span>
   </div>
 </div>
